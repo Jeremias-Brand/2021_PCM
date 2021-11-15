@@ -1,0 +1,759 @@
+---
+title: "08_PCA"
+author: "Jeremias Brand"
+date: "28 Mai 2019"
+output: html_document
+---
+
+```{r}
+require(knitr)
+opts_knit$set(root.dir = "..")
+```
+
+
+
+```{r results="hide", warning=FALSE }
+
+source("R/functions.R")
+library(dplyr)
+library(scales)
+library(tidyr)
+library(ggplot2)
+library(readxl)
+library(purrr)
+library(ape)
+library(phytools)
+library(geiger)
+library(phangorn)
+library(forcats)
+library(viridis)
+library(ggtree)
+library(RColorBrewer)
+library(grid)
+library(gridExtra)
+library(gtable)
+library(stringr)
+library(ICC)
+library(lmtest)
+library(nlme)
+library(ggrepel)
+library(cowplot)
+library(rr2)
+library(animation)
+
+cols <- c("black", "lightblue", "blue", "Grey")
+shapes <- c(19,17,15,1)
+treename = "Short"
+
+
+pr = "#006837"
+int = "#78c679"
+ab = "#ffffcc"
+
+palette1 <- c(pr, int, ab, "grey")
+palette2 <- c(ab, int, pr, "grey")
+palette3 <- c(ab, pr, "grey")
+# Prevent MASS and dplyr clashes
+select <- dplyr::select
+```
+
+## Load data
+
+```{r}
+## Load data
+
+m_df <- readxl::read_excel("Tab_S2.xlsx", sheet = 2, na = c("","NA"),
+                                 col_types = c("text", "text", rep("numeric",8)))
+
+
+s_df <- readxl::read_excel("Tab_S3.xlsx", sheet = 2, na = c("","NA"),
+                                  col_types = c(
+                                    rep("text",5),
+                                    rep("numeric",10),
+                                    "text",
+                                    rep("numeric",12),
+                                    "text"
+                                    )
+                                 )
+
+N_df <- readxl::read_excel("Tab_S1.xlsx", sheet = 2) %>%
+  mutate(
+    Species = gsub("M\\.", "Macrostomum", Species)
+  )
+```
+
+## Transform the data
+
+We want to do mean(log10(x)) *NOT* log(mean(x)). 
+Since the former is a much better representation of a species value.
+
+
+```{r}
+morpho_df <- m_df %>%
+  group_by(sci_name, ID) %>%
+  mutate_at(c("body_size"), funs(body_size_logsqrt = log10(sqrt(.)))) %>%
+  mutate_at(c("stylet_length", "stylet_proximal", "stylet_distal", "sperm_length", "bristle_length"),
+            funs(log = log10(.))) %>%
+  mutate_at(c( "bristle_length", "stylet_asymmetry"), funs(log = log10(. + 1)))
+
+morpho_df2 <- morpho_df %>%
+  group_by(sci_name) %>%
+  select(sci_name, contains("log"), stylet_curvyness) %>%
+  summarise_if(is.numeric, 
+               funs(mean = mean(., na.rm = TRUE), 
+                       N = sum(!is.na(.)))
+               ) %>%
+  mutate( sci_name_short = gsub(" ", "_", gsub("Macrostomum", "M.", sci_name)))
+```
+
+## LOAD TREES
+
+```{r}
+trees <- readRDS(file = paste0("trees.Rdata"))
+ltre <- length(trees)
+
+# Color the hypodermic clade
+t_injecting_clade <- extract.clade(trees[[3]],154)
+names_injecting <- t_injecting_clade$tip.label
+
+s_df$clade <- ifelse(s_df$Short %in% names_injecting, "clade1", "clade2")
+
+species_df <- s_df %>%
+  mutate(sci_name_short = gsub(" ", "_", gsub("Macrostomum", "M.", Species)),
+         inferred_syndrome_2states = case_when(
+           inferred_syndrome == "intermediate" ~ "hypodermic",
+           TRUE ~ inferred_syndrome)
+         ) %>%
+  select(-contains("mean"))
+
+# Some in the species list have not been measured
+species_df$Species %in% morpho_df2$sci_name
+sum(species_df$Species %in% morpho_df2$sci_name)
+
+# All measured are in the species list
+morpho_df2$sci_name %in% species_df$Species
+
+# Combine them
+main_df <- left_join(species_df, morpho_df2, by = "sci_name_short")
+
+length(species_df$Short)
+species_df$Short %in% trees[[3]]$tip.label
+
+```
+
+## Color palette
+
+```{r}
+Nclusters=3
+cl <- parallel::makeCluster(Nclusters)
+doParallel::registerDoParallel(cl)
+library(foreach)
+
+pr = "#006837"
+int = "#78c679"
+ab = "#ffffcc"
+
+palette1 <- c(pr, int, ab, "grey")
+palette2 <- c(ab, int, pr, "grey")
+palette3 <- c(ab, pr, "grey")
+```
+
+
+### multiply trees by 100 
+
+The ML optimizer can run into issues due to numeric underflow. 
+
+```{r}
+trees <- lapply(trees,function(tre){tre$edge.length <- tre$edge.length * 100; return(tre)})
+```
+
+Make sure we are using factors
+
+```{r}
+main_df <- main_df %>%
+  mutate(Rec_binary = factor(Rec_binary, levels = c(0,1)),
+         bristle_binary = factor(bristle_binary, levels = c(0,1)),
+         inferred_syndrome_2states = factor(inferred_syndrome_2states, 
+                                            levels = c("hypodermic","reciprocal")))
+```
+
+# Prepare data for PCA
+
+We want to use both the catgorical as well as the quantitative traits.
+To make them comparable they need to be scaled. So all traits will be transformed
+to be between 0 and 1. 
+
+```{r}
+# In previous version things had different names
+main_df <- main_df %>%
+  rename(
+    brstlLen_um_per_sperm_log_mean = bristle_length_log_mean,
+    bdSize_um_logsqrt_mean = body_size_logsqrt_mean, 
+    sty_avg_um_log_mean = stylet_length_log_mean,
+    wb_um_log_mean = stylet_proximal_log_mean,
+    wt_um_log_mean = stylet_distal_log_mean,
+    delta_e_um_log_mean = stylet_asymmetry_log_mean,
+    total_sprmLen_um_log_mean = sperm_length_log_mean,
+    sty_curveSum_avg_mean = stylet_curvyness_mean
+  )
+  
+var_of_interest[!var_of_interest %in% names(main_df)]
+  
+var_of_interest <- c("brstlLen_um_per_sperm_log_mean",
+  "bdSize_um_logsqrt_mean", 
+  "sty_avg_um_log_mean", "wb_um_log_mean", "wt_um_log_mean", "delta_e_um_log_mean",
+  "total_sprmLen_um_log_mean","eye", "Rec", 
+  "ant_thickness", "ant_cellular_valve", 
+  "ant_chambers", "No_openings",
+  "bristle", "brush", "velum",
+   "sharp", "an_complex_noc_noo")
+
+
+quant_df <- main_df %>%
+  select(Short,one_of(var_of_interest)) %>%
+  rowwise() %>%
+  as.data.frame()
+
+scaled_df <- quant_df %>%
+  mutate_if(is.numeric, funs(scales::rescale), to=c(0,1)) %>%
+  rowwise() %>%
+  as.data.frame()
+
+row.names(quant_df) <- quant_df$Short
+row.names(scaled_df) <- scaled_df$Short
+```
+
+## Plot all traits next to tree
+
+```{r}
+for (i in 1:ltre) {
+pdf(paste0("fig/scaled_traits_plotted_",names(trees)[[i]],".pdf"), height = 24, width = 10)
+t_UM = trees[[i]]
+col_pal <- viridis(n=10, option = "A")
+col_l = col_pal[[1]]
+col_h = col_pal[[10]]
+p <- ggtree(t_UM) + geom_tiplab(size=2)
+print(gheatmap(p, select(scaled_df, -(Short:Rec)), offset=0.05, width=0.2,
+         low=col_l, high=col_h, colnames_position = "top",
+         colnames_angle = 90, colnames_offset_y = 2.6,  font.size=2) )
+
+print(gheatmap(p, select(scaled_df, (ant_thickness:bristle)), offset=0.05, width=0.2,
+         low=col_l, high=col_h, colnames_position = "top",
+         colnames_angle = 90, colnames_offset_y = 2.6,  font.size=2)) 
+
+print(gheatmap(p, select(scaled_df, c(an_complex_noc_noo,bristle)), offset=0.05, width=0.2,
+         low=col_l, high=col_h, colnames_position = "top",
+         colnames_angle = 90, colnames_offset_y = 2.6,  font.size=2))
+
+print(gheatmap(p, select(scaled_df, Rec, bristle), offset=0.05, width=0.2,
+         low=col_l, high=col_h, colnames_position = "top",
+         colnames_angle = 90, colnames_offset_y = 2.6,  font.size=2))
+dev.off()
+}
+```
+
+
+## PCA of all traits
+
+```{r}
+for (i in 1:ltre) {
+  ignore = c("Rec", "bristle", "clade", "inferred_syndrome")
+  
+  ppca1 <- main_df %>%
+    select(Short, Rec, bristle, clade, inferred_syndrome,
+           # stylet traits
+           sty_avg_um_log_mean,
+           wt_um_log_mean,
+           wb_um_log_mean,
+           sty_curveSum_avg_mean,
+           #sty_curveSum_scaled_mean,
+           delta_e_um_log_mean,
+           sharp,
+           # sperm traits
+           total_sprmLen_um_log_mean,
+           brstlLen_um_per_sperm_log_mean,
+           velum,
+           brush,
+           # antrum traits
+           ant_thickness,
+           ant_cellular_valve,
+           ant_chambers,
+           No_openings,
+           # body size
+           bdSize_um_logsqrt_mean) %>%
+    mutate(
+      brush = ifelse(brush %in% c(1,2),1, ifelse(!is.na(brush),0,NA))
+      ) %>% 
+    rename(
+      'stylet length (logum)' = sty_avg_um_log_mean,
+      'width distal stylet opening (logum)' = wt_um_log_mean,
+      'width proximal stylet opening (logum)' = wb_um_log_mean,
+      'curviness of stylet' = sty_curveSum_avg_mean,
+      #'curviness of stylet' = sty_curveSum_scaled_mean,
+      'asymetry of distal thickening (logum)' = delta_e_um_log_mean,
+      'sharpness of stylet' = sharp,
+      # sperm traits
+      'sperm length (logum)'=total_sprmLen_um_log_mean,
+      'sperm bristle length (logum)' = brstlLen_um_per_sperm_log_mean,
+      'sperm velum' = velum,
+      'sperm brush' = brush,
+      # antrum traits
+      'antrum thickness' = ant_thickness,
+      'antrum cellular valve' = ant_cellular_valve,
+      'complexity of antrum chamber' = ant_chambers,
+      'number of vaginas' = No_openings,
+           # body size
+      'body area (logsqrtum)' = bdSize_um_logsqrt_mean
+      )%>% 
+  as.data.frame() %>%
+  prepare_phyl_pca(tree = trees[[i]], ignore=ignore)
+  
+  var_order <- c('stylet length (logum)',
+      'curviness of stylet',
+      'width proximal stylet opening (logum)',
+      'width distal stylet opening (logum)',
+      'asymetry of distal thickening (logum)',
+      'sharpness of stylet',
+      'sperm length (logum)',
+      'sperm bristle length (logum)',
+      'sperm velum',
+      'sperm brush',
+      'antrum thickness',
+      'antrum cellular valve',
+      'complexity of antrum chamber',
+      'number of vaginas',
+      'body area (logsqrtum)')
+  # remove the ignored columns which are just used to paint later
+  tmp_df <- ppca1[[1]][,setdiff(names(ppca1[[1]]), c(treename, ignore))]
+  t <- ppca1[[2]]
+  
+  cols <- c("black", "#1FBDCC", "#FF0E98", "grey")
+  
+  pPCA_1 <- phyl.pca(t, tmp_df, method = "lambda", mode="corr")
+  
+    # I want the majority of the loadings to be positive
+  if (sum(-1*pPCA_1$L[,1]) > sum(pPCA_1$L[,1])){
+    pPCA_1$L[,1] <- -1*pPCA_1$L[,1]
+    pPCA_1$S[,1] <- -1*pPCA_1$S[,1]
+  }
+
+  if (sum(-1*pPCA_1$L[,2]) > sum(pPCA_1$L[,2])){
+    pPCA_1$L[,2] <- -1*pPCA_1$L[,2]
+    pPCA_1$S[,2] <- -1*pPCA_1$S[,2]
+  }
+  
+  pPCA_1_L <- as.data.frame(pPCA_1$L) %>%
+  mutate(var = rownames(pPCA_1$L))
+  
+  pPCA_1_S <- as.data.frame(pPCA_1$S)  %>%
+  mutate(Short = rownames(pPCA_1$S))
+  
+  ppca1[[1]]$Rec <- ifelse(is.na(ppca1[[1]]$Rec), "no_observation", ppca1[[1]]$Rec)
+  
+  main_df %>% 
+    select(Short,inferred_syndrome, bristle, sharp,
+         an_binary, an_complex_noc_noo, Rec) %>% 
+    write.csv("output/inferred_syndrome_summary.csv")
+  
+  ## morphospace plot
+  # color by label
+  ppca1[[1]]$inferred_syndrome[match(ppca1[[2]]$tip.label, ppca1[[1]]$Short)]
+  colmap <- setNames(palette2[1:length(unique(ppca1[[1]]$inferred_syndrome))],
+                     sort(unique(ppca1[[1]]$inferred_syndrome)))
+  ordered_trait <- ppca1[[1]]$inferred_syndrome[match(ppca1[[2]]$tip.label,
+                                                      ppca1[[1]]$Short)]
+  
+  tipcols <- colmap[match(ordered_trait, names(colmap))]
+  names(tipcols) <- ppca1[[2]]$tip.label
+  t_cols<-c(tipcols[ppca1[[2]]$tip.label],rep("black",ppca1[[2]]$Nnode))
+  names(t_cols)<-1:(length(ppca1[[2]]$tip)+ppca1[[2]]$Nnode)
+
+  # ani.record(reset = TRUE)
+  # project.phylomorphospace_mod(ppca1[[2]], pPCA_1$S[,1:2],
+  #                          direction = "to", sleep=0, 
+  #                          control=list(col.node=t_cols 
+  #                                       ), node.size=c(0.8,1.8),
+  #                          xlab="PC1",ylab="PC2")
+  #   
+  # oopts = ani.options(interval = 0.01)
+  # ani.replay()
+  # saveGIF(ani.replay(), img.name = "record_plot",
+  #           ani.height = 1000, ani.width=1000)
+
+
+  
+  pPCA_1$L
+  #####################
+  ## 
+  ####
+  size = 8
+  stroke = 1
+  alpha = 0.8
+  shapes <- c(21,24,22,21)
+  #shapes = c(16,17,15,18)
+ # cols <- c("black", "#1FBDCC", "#FF0E98", "grey")
+  
+  pPCA_plane <- ggplot(as.data.frame(pPCA_1$S), aes(x = PC1, y=PC2)) +
+    geom_point(aes(shape= factor(ppca1[[1]]$bristle)),
+               size=size, stroke = stroke,fill="black") +
+    scale_shape_manual(labels = c("absent", "reduced", "present"), values = shapes) +
+    labs(shape = "sperm bristle category", fill = "clade") +
+    #theme(legend.position = "none")
+        theme(legend.position = c(0.05, 0.8), legend.direction="horizontal") +
+      guides(fill=guide_legend(override.aes=list(shape=21)))
+  
+  legend_pPCA_plane <- get_legend(pPCA_plane)
+  pPCA_plane 
+    
+  pPCA_clade <- ggplot(as.data.frame(pPCA_1$S), aes(x = PC1, y=PC2)) +
+    geom_point(aes(fill= factor(ppca1[[1]]$clade),
+                   shape= factor(ppca1[[1]]$bristle)),
+               size=size, stroke = stroke, alpha=alpha) +
+    scale_fill_manual(labels = c("clade1", "clade2"), values = cols) +
+    scale_shape_manual(labels = c("absent", "reduced", "present"), values = shapes) +
+    labs(shape = "sperm bristle category", fill = "clade") +
+    #theme(legend.position = "none")
+    theme(legend.position = c(0.05, 0.8), legend.direction="horizontal") +
+      guides(fill=guide_legend(override.aes=list(shape=21)))
+  legend_pPCA_clade <- get_legend(pPCA_clade)
+  
+  pPCA_clade
+  # reverse colors for consistentcy
+  cols <- palette1
+  pPCA_p1 <- ggplot(as.data.frame(pPCA_1$S), aes(x = PC1, y=PC2)) +
+    geom_point(aes(shape= factor(ppca1[[1]]$bristle), fill=factor(ppca1[[1]]$Rec)),
+               size=size, stroke = stroke, alpha=alpha) +
+    scale_fill_manual(labels = c("an", "both", "hy", "no observation"), values = cols) + 
+    scale_shape_manual(labels = c("absent", "reduced", "present"), values = shapes) + 
+    labs(shape = "sperm bristle category", fill = "Received sperm location") +
+    #theme(legend.position = "none")
+    theme(legend.position = c(0.05, 0.8), legend.direction="horizontal") +
+      guides(fill=guide_legend(override.aes=list(shape=21)))
+  legend_pPCA_p1 <- get_legend(pPCA_p1)
+  pPCA_p1 
+  
+  cols <- palette1
+  pPCA_inferred <- ggplot(as.data.frame(pPCA_1$S), aes(x = PC1, y=PC2)) +
+    geom_point(aes(shape= factor(ppca1[[1]]$bristle), fill=factor(ppca1[[1]]$inferred_syndrome)), 
+               size=size, stroke = stroke, alpha=alpha) +
+    scale_fill_manual(labels = c("reciprocal", "intermediate", "hypodermic", "no observation"), values = palette2) + 
+    scale_shape_manual(labels = c("absent", "reduced", "present"), values = shapes) + 
+    labs(shape = "sperm bristle category", fill = "Inferred mating syndrome") +
+    #theme(legend.position = "none")
+    theme(legend.position = c(0.05, 0.8), legend.direction="horizontal") +
+    guides(fill=guide_legend(override.aes=list(shape=21)))
+  legend_pPCA_inferred <- get_legend(pPCA_inferred)
+  pPCA_inferred
+  
+  ## PCA Result with inferred syndrome and clade combined
+  
+  pPCA_inferred1 <- ggplot(as.data.frame(pPCA_1$S), aes(x = PC1, y=PC2)) +
+    geom_point(aes(shape= factor(ppca1[[1]]$clade), fill=factor(ppca1[[1]]$inferred_syndrome)), 
+               size=size, stroke = stroke, alpha=alpha) +
+    scale_fill_manual(labels = c("reciprocal", "intermediate", "hypodermic", "no observation"), values = palette2) + 
+    scale_shape_manual(labels = c("absent", "reduced", "present"), values = c(24,21)) + 
+    labs(shape = "sperm bristle category", fill = "Inferred mating syndrome") +
+    #theme(legend.position = "none")
+    theme(legend.position = c(0.05, 0.8), legend.direction="horizontal") +
+    guides(fill=guide_legend(override.aes=list(shape=21)))
+  legend_pPCA_inferred1 <- get_legend(pPCA_inferred1)
+  
+  pPCA_inferred1 + theme(legend.position = "none")
+  
+  #################
+  
+  
+  plot_grid(pPCA_clade, pPCA_p1, pPCA_inferred,ncol=1)
+  plot_grid( pPCA_p1, pPCA_inferred + geom_text_repel(aes(label = ppca1[[1]]$Short),
+              nudge_x = 0.05, nudge_y = 0.02, size = 3),ncol=1)
+  
+  heatp <-   pPCA_1_L %>%
+  gather(key = PC, value = val, PC1:PC5) %>%
+    mutate(var = factor(var, levels = rev(var_order))) %>%
+  ggplot(aes(x = PC, y = var)) +
+  geom_tile(aes(fill=val)) +
+  geom_text(aes(label=round(val,2)), size =9) + 
+  scale_fill_gradient2(low="royalblue", mid="white", high="firebrick1") +
+    theme(legend.position = "none", 
+          axis.title = element_blank())
+  print(heatp)
+  
+  
+  heatp_small <-   pPCA_1_L %>%
+  gather(key = PC, value = val, PC1:PC2) %>%
+    mutate(var = factor(var, levels = rev(var_order))) %>%
+  ggplot(aes(x = PC, y = var)) +
+  geom_tile(aes(fill=val)) +
+  geom_text(aes(label=round(val,2)), size =9) + 
+  scale_fill_gradient2(low="royalblue", mid="white", high="firebrick1") +
+  theme(legend.position = "none", 
+          axis.title = element_blank())
+  print(heatp_small)
+  
+  
+  var_exp <- diag(pPCA_1$Eval)/sum(pPCA_1$Eval)*100
+  df <- data.frame(var_explained=var_exp,
+                   cum_var_explained = cumsum(var_exp))
+  df$PC <- rownames(df)
+  df$PC <- factor(df$PC, levels = df$PC)
+  pl <- ggplot(df) +
+  geom_bar(aes(x=PC, var_explained), stat = "identity") +
+  geom_text(aes(x=PC, y= -0.5, label=round(cum_var_explained,1)))
+  print(pl)
+  
+  ##
+  closeAllConnections()
+  pdf(paste0("fig/pPCA_selected_traits_", names(trees)[[i]],".pdf"),width = 10, height = 10, useDingbats = FALSE)
+  print(pPCA_plane + theme(legend.position = "none"))
+  print(pPCA_clade + theme(legend.position = "none"))
+  print(pPCA_p1 + theme(legend.position = "none"))
+  print(pPCA_p1 + theme(legend.position = "none") + geom_text_repel(aes(label = ppca1[[1]]$Short),
+              nudge_x = 0.05, nudge_y = 0.02, size = 3))
+  print(pPCA_inferred + theme(legend.position = "none"))
+  print(pPCA_inferred1 + theme(legend.position = "none"))
+  print(plot_grid(
+     legend_pPCA_plane,
+     legend_pPCA_clade,  
+     legend_pPCA_p1,
+     legend_pPCA_inferred
+    ))
+  print(heatp)
+  print(heatp_small)
+  print(pl)
+  dev.off()
+  
+  pdf(paste0("fig/pPCA_selected_traits_inferred_", names(trees)[[i]],".pdf"),width = 10, height = 7, useDingbats = FALSE)
+  print(pPCA_inferred + theme(legend.position = "none"))
+  print(pPCA_inferred1 + theme(legend.position = "none"))
+  dev.off()
+  
+  ####################
+  ggplot(as.data.frame(pPCA_1$S), aes(x = PC1, y=PC2)) +
+    geom_point(aes(color= factor(ppca1[[1]]$clade)), size=8, shape = 1) +
+    geom_point(aes(color= factor(ppca1[[1]]$bristle), shape=factor(ppca1[[1]]$Rec)), size=4)  
+  
+  pPCA_p1
+  pPCA_p1_lab <- pPCA_p1 + geom_text_repel(aes(label = ppca1[[1]]$Short),
+              nudge_x = 0.05, nudge_y = 0.02, size = 3)
+  
+  pdf(paste0("fig/PCA_no_cilia_removeNA_", names(trees)[[i]],".pdf"), width=14, height=10)
+  print(pPCA_p1)
+  print(pPCA_p1 + 
+    geom_text(data=pPCA_1_L, aes(x=PC1, y=PC2,  label = rownames(pPCA_1$L))) +
+    geom_segment(data=pPCA_1_L, aes(x=0, y=0, xend=PC1, yend=PC2),
+                 arrow=arrow(length = unit(0.01, "npc")),
+                 size=1, color="grey", alpha = 0.8))
+  
+  print(pPCA_p1_lab + 
+    geom_text(data=pPCA_1_L, aes(x=PC1, y=PC2,  label = rownames(pPCA_1$L))) +
+    geom_segment(data=pPCA_1_L, aes(x=0, y=0, xend=PC1, yend=PC2),
+                 arrow=arrow(length = unit(0.01, "npc")),
+                 size=1, color="grey", alpha = 0.8))
+  
+  pPCA_p1_e <- pPCA_p1 + 
+  stat_ellipse(aes(color=factor(ppca1[[1]]$bristle),
+                   group=factor(ppca1[[1]]$bristle)),
+                   level = 0.95, geom = "polygon",
+               alpha = 0, type = "t", size=2) +
+  scale_color_manual(labels = c("absent", "reduced", "present"), values = cols) 
+
+    legend1 <- get_legend(pPCA_p1_e)
+    desc <- "95% confidence ellipse assuming t-distribution"
+    pf1 <- pPCA_p1_e +theme(legend.position="none")
+  pPCA_p1_format <- pf1 + draw_label(desc, 0.6, 1.45) + ggtitle("PCA categorical data - removed species with missing data")
+  print(pPCA_p1_format)
+  
+  var_exp <- diag(pPCA_1$Eval)/sum(pPCA_1$Eval)*100
+  df <- data.frame(var_explained=var_exp,
+                   cum_var_explained = cumsum(var_exp))
+  df$PC <- rownames(df)
+  df$PC <- factor(df$PC, levels = df$PC)
+  pl <- ggplot(df) +
+  geom_bar(aes(x=PC, var_explained), stat = "identity") +
+  geom_text(aes(x=PC, y= -0.5, label=round(cum_var_explained,1)))
+  print(pl)
+  dev.off()
+  
+  # output data
+  lambda <- round(pPCA_1$lambda,2)
+  pPCA_1_S$lambdaPCA <- lambda
+  write.csv(pPCA_1_S,
+            paste0("output/PCA_no_cilia_removeNA_values_",
+                   names(trees)[[i]], ".csv"),
+            row.names = FALSE)
+  write.csv(pPCA_1_L, paste0("output/PCA_no_cilia_removeNA_loadings_",
+                             names(trees)[[i]], ".csv"),
+            row.names = FALSE)
+  }
+```
+
+phylomorphospace plot for main figure
+
+```{r}
+ignore = c("Rec", "bristle", "clade", "inferred_syndrome")
+  
+ppca1 <- main_df %>%
+  select(Short, Rec, bristle, clade, inferred_syndrome,
+         # stylet traits
+         sty_avg_um_log_mean,
+         wt_um_log_mean,
+         wb_um_log_mean,
+         sty_curveSum_avg_mean,
+         #sty_curveSum_scaled_mean,
+         delta_e_um_log_mean,
+         sharp,
+         # sperm traits
+         total_sprmLen_um_log_mean,
+         brstlLen_um_per_sperm_log_mean,
+         velum,
+         brush,
+         # antrum traits
+         ant_thickness,
+         ant_cellular_valve,
+         ant_chambers,
+         No_openings,
+         # body size
+         bdSize_um_logsqrt_mean) %>%
+  mutate(
+    brush = ifelse(brush %in% c(1,2),1, ifelse(!is.na(brush),0,NA))
+    ) %>% 
+  rename(
+    'stylet length (logum)' = sty_avg_um_log_mean,
+    'width distal stylet opening (logum)' = wt_um_log_mean,
+    'width proximal stylet opening (logum)' = wb_um_log_mean,
+    'curviness of stylet' = sty_curveSum_avg_mean,
+    #'curviness of stylet' = sty_curveSum_scaled_mean,
+    'asymetry of distal thickening (logum)' = delta_e_um_log_mean,
+    'sharpness of stylet' = sharp,
+    # sperm traits
+    'sperm length (logum)'=total_sprmLen_um_log_mean,
+    'sperm bristle length (logum)' = brstlLen_um_per_sperm_log_mean,
+    'sperm velum' = velum,
+    'sperm brush' = brush,
+    # antrum traits
+    'antrum thickness' = ant_thickness,
+    'antrum cellular valve' = ant_cellular_valve,
+    'complexity of antrum chamber' = ant_chambers,
+    'number of vaginas' = No_openings,
+         # body size
+    'body area (logsqrtum)' = bdSize_um_logsqrt_mean
+    )%>%
+  as.data.frame() %>%
+prepare_phyl_pca(tree = trees[[i]], ignore=ignore)
+
+var_order <- c('stylet length (logum)',
+    'curviness of stylet',
+    'width proximal stylet opening (logum)',
+    'width distal stylet opening (logum)',
+    'asymetry of distal thickening (logum)',
+    'sharpness of stylet',
+    'sperm length (logum)',
+    'sperm bristle length (logum)',
+    'sperm velum',
+    'sperm brush',
+    'antrum thickness',
+    'antrum cellular valve',
+    'complexity of antrum chamber',
+    'number of vaginas',
+    'body area (logsqrtum)')
+# remove the ignored columns which are just used to paint later
+tmp_df <- ppca1[[1]][,setdiff(names(ppca1[[1]]), c(treename, ignore))]
+t <- ppca1[[2]]
+
+cols <- c("black", "#1FBDCC", "#FF0E98", "grey")
+
+pPCA_1 <- phyl.pca(t, tmp_df, method = "lambda", mode="corr")
+
+  # I want the majority of the loadings to be positive
+if (sum(-1*pPCA_1$L[,1]) > sum(pPCA_1$L[,1])){
+  pPCA_1$L[,1] <- -1*pPCA_1$L[,1]
+  pPCA_1$S[,1] <- -1*pPCA_1$S[,1]
+}
+
+if (sum(-1*pPCA_1$L[,2]) > sum(pPCA_1$L[,2])){
+  pPCA_1$L[,2] <- -1*pPCA_1$L[,2]
+  pPCA_1$S[,2] <- -1*pPCA_1$S[,2]
+}
+
+pPCA_1_L <- as.data.frame(pPCA_1$L) %>%
+mutate(var = rownames(pPCA_1$L))
+
+pPCA_1_S <- as.data.frame(pPCA_1$S)  %>%
+mutate(Short = rownames(pPCA_1$S))
+
+ppca1[[1]]$Rec <- ifelse(is.na(ppca1[[1]]$Rec), "no_observation", ppca1[[1]]$Rec)
+
+## morphospace plot
+# color by label
+ppca1[[1]]$inferred_syndrome[match(ppca1[[2]]$tip.label, ppca1[[1]]$Short)]
+colmap <- setNames(palette2[1:length(unique(ppca1[[1]]$inferred_syndrome))],
+                   sort(unique(ppca1[[1]]$inferred_syndrome)))
+ordered_trait <- ppca1[[1]]$inferred_syndrome[match(ppca1[[2]]$tip.label,
+                                                    ppca1[[1]]$Short)]
+
+tipcols <- colmap[match(ordered_trait, names(colmap))]
+names(tipcols) <- ppca1[[2]]$tip.label
+t_cols<-c(tipcols[ppca1[[2]]$tip.label],rep("black",ppca1[[2]]$Nnode))
+names(t_cols)<-1:(length(ppca1[[2]]$tip)+ppca1[[2]]$Nnode)
+
+tree=ppca1[[2]]
+X=pPCA_1$S[,1:2]
+nsteps = 200
+direction="to"
+sleep=0
+lab = "off"
+#tree <- minRotate(reorder(tree, "cladewise"), X[, 2], print = FALSE)
+X <- X[tree$tip.label, ]
+A <- cbind(fastAnc(tree, X[, 1]), fastAnc(tree, X[, 2]))
+cladogram <- tree
+cladogram$edge.length <- NULL
+mar <- par()$mar
+plotTree(cladogram, type = "cladogram", nodes = "centered", 
+         plot = FALSE)
+obj <- get("last_plot.phylo", envir = .PlotPhyloEnv)
+obj$xx <- obj$xx * (max(c(X[, 1], A[, 1])) - min(c(X[, 1], 
+                                                   A[, 1]))) + min(c(X[, 1], A[, 1]))
+xlim <- range(obj$xx)
+xlim[2] <- xlim[2] + abs(diff(xlim)) * (obj$x.lim[2] - 1)
+obj$yy <- (obj$yy - min(obj$yy))/(max(obj$yy) - min(obj$yy)) * 
+  (max(c(X[, 2], A[, 2])) - min(c(X[, 2], A[, 2]))) + min(c(X[, 
+                                                              2], A[, 2]))
+ylim <- range(obj$yy)
+X0 <- cbind(obj$xx[1:Ntip(tree)], obj$yy[1:Ntip(tree)])
+rownames(X0) <- tree$tip.label
+A0 <- cbind(obj$xx[1:tree$Nnode + Ntip(tree)], obj$yy[1:tree$Nnode + 
+                                                        Ntip(tree)])
+rownames(A0) <- 1:tree$Nnode + Ntip(tree)
+
+
+edge_length <- length(tree$edge[,2])
+xx <- edge_length-179
+e_cols <- c(rep("black", edge_length-xx), rep("grey", xx))
+names(e_cols) <- tree$edge[,2]
+if (direction == "both") 
+  nsteps <- ceiling(nsteps/2)
+xlim=c(-2,6)
+for (i in 0:nsteps) {
+
+  if (i%%100 == 0) {
+  pdf(paste0("fig/phymorph/",i,".pdf"), width = 14, height = 14)
+  phylomorphospace(tree, ((nsteps - i) * X0 + i * X)/nsteps, 
+                   ((nsteps - i) * A0 + i * A)/nsteps, xlim = xlim, 
+                   ylim = ylim, label = lab,
+                   control=list(col.node=t_cols, col.edge=e_cols
+                                    ), node.size=c(0.0,4),
+                       xlab="PC1",ylab="PC2",lwd=3) # add ... support again
+  dev.off()
+  }
+}
+
+```
+
+
+```{r}
+project.phylomorphospace_mod(ppca1[[2]], pPCA_1$S[,1:2],
+                           direction = "to", sleep=0,
+                           control=list(col.node=t_cols
+                                        ), node.size=c(0.8,1.8),
+                           xlab="PC1",ylab="PC2")
+```

@@ -1,0 +1,828 @@
+---
+title: "18_inferred_vs_sperm_length"
+author: "Jeremias Brand"
+date: "12 Januar 2020"
+output: html_document
+---
+
+
+```{r}
+require(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+opts_knit$set(root.dir = "..")
+```
+
+
+```{r results="hide", warning=FALSE }
+
+source("R/functions.R")
+library(dplyr)
+library(scales)
+library(tidyr)
+library(picante)
+library(ggplot2)
+library(readxl)
+library(writexl)
+library(purrr)
+library(ape)
+library(phytools)
+library(geiger)
+library(phangorn)
+library(forcats)
+library(viridis)
+library(ggtree)
+library(RColorBrewer)
+library(grid)
+library(gridExtra)
+library(gtable)
+library(ggstance)
+library(stringr)
+library(ICC)
+library(lmtest)
+library(nlme)
+library(bayou)
+library(ggrepel)
+library(plotly)
+library(cowplot)
+library(rr2)
+
+cols <- c("black", "lightblue", "blue", "Grey")
+shapes <- c(19,17,15,1)
+treename = "Short"
+
+
+pr = "#006837"
+int = "#78c679"
+ab = "#ffffcc"
+
+palette1 <- c(pr, int, ab, "grey")
+palette2 <- c(ab, int, pr, "grey")
+palette3 <- c(ab, pr, "grey")
+# Prevent MASS and dplyr clashes
+select <- dplyr::select
+```
+
+## Load data
+
+```{r}
+## Load data
+
+m_df <- readxl::read_excel("Tab_S2.xlsx", sheet = 2, na = c("","NA"),
+                                 col_types = c("text", "text", rep("numeric",8)))
+
+
+s_df <- readxl::read_excel("Tab_S3.xlsx", sheet = 2, na = c("","NA"),
+                                  col_types = c(
+                                    rep("text",5),
+                                    rep("numeric",10),
+                                    "text",
+                                    rep("numeric",12),
+                                    "text"
+                                    )
+                                 )
+
+N_df <- readxl::read_excel("Tab_S1.xlsx", sheet = 2) %>%
+  mutate(
+    Species = gsub("M\\.", "Macrostomum", Species)
+  )
+```
+
+## Transform the data
+
+We want to do mean(log10(x)) *NOT* log(mean(x)). 
+Since the former is a much better representation of a species value.
+
+
+```{r}
+morpho_df <- m_df %>%
+  group_by(sci_name, ID) %>%
+  mutate_at(c("body_size"), funs(body_size_logsqrt = log10(sqrt(.)))) %>%
+  mutate_at(c("stylet_length", "stylet_proximal", "stylet_distal", "sperm_length", "bristle_length"),
+            funs(log = log10(.))) %>%
+  mutate_at(c("stylet_curvyness", "bristle_length"), funs(log = log10(. + 1)))
+
+morpho_df2 <- morpho_df %>%
+  group_by(sci_name) %>%
+  select(sci_name, contains("log")) %>%
+  summarise_if(is.numeric, 
+               funs(mean = mean(., na.rm = TRUE), 
+                       N = sum(!is.na(.)))
+               ) %>%
+  mutate( sci_name_short = gsub(" ", "_", gsub("Macrostomum", "M.", sci_name)))
+```
+
+## LOAD TREES
+
+```{r}
+trees <- readRDS(file = paste0("trees.Rdata"))
+ltre <- length(trees)
+
+# Color the hypodermic clade
+t_injecting_clade <- extract.clade(trees[[3]],154)
+names_injecting <- t_injecting_clade$tip.label
+
+s_df$clade <- ifelse(s_df$Short %in% names_injecting, "clade1", "clade2")
+
+species_df <- s_df %>%
+  mutate(sci_name_short = gsub(" ", "_", gsub("Macrostomum", "M.", Species)),
+         inferred_syndrome_2states = case_when(
+           inferred_syndrome == "intermediate" ~ "hypodermic",
+           TRUE ~ inferred_syndrome)
+         ) %>%
+  select(-contains("mean"))
+
+# Some in the species list have not been measured
+species_df$Species %in% morpho_df2$sci_name
+sum(species_df$Species %in% morpho_df2$sci_name)
+
+# All measured are in the species list
+morpho_df2$sci_name %in% species_df$Species
+
+# Combine them
+main_df <- left_join(species_df, morpho_df2, by = "sci_name_short")
+
+length(species_df$Short)
+species_df$Short %in% trees[[3]]$tip.label
+
+```
+
+## Color palette
+
+```{r}
+Nclusters=3
+cl <- parallel::makeCluster(Nclusters)
+doParallel::registerDoParallel(cl)
+library(foreach)
+
+pr = "#006837"
+int = "#78c679"
+ab = "#ffffcc"
+
+palette1 <- c(pr, int, ab, "grey")
+palette2 <- c(ab, int, pr, "grey")
+palette3 <- c(ab, pr, "grey")
+```
+
+
+### multiply trees by 100 
+
+The ML optimizer can run into issues due to numeric underflow. 
+
+```{r}
+trees <- lapply(trees,function(tre){tre$edge.length <- tre$edge.length * 100; return(tre)})
+```
+
+Make sure we are using factors
+
+```{r}
+main_df <- main_df %>%
+  mutate(Rec_binary = factor(Rec_binary, levels = c(0,1)),
+         bristle_binary = factor(bristle_binary, levels = c(0,1)),
+         inferred_syndrome_2states = factor(inferred_syndrome_2states, 
+                                            levels = c("hypodermic","reciprocal")))
+```
+
+## Effect of sperm length
+
+Model comparison should be done using ML not REML.
+Model fitting however should be done using REML because ML is biased especially if
+number of parameters (p) is similar in size to number of observations (N).
+
+### Setup formulas and switches
+
+```{r}
+outname <- "EL_sperm_length_cat"
+FILTER = FALSE
+DIAGNOSTIC = FALSE
+#syndrome = "hypodermic"
+
+pred_name <- list("received sperm binary",
+                  "bristle state binary",
+                  "antrum binary",
+                  "inferred syndrome binary")
+preds <- list("Rec_binary",
+              "bristle_binary",
+              "an_binary",
+              "inferred_syndrome_2states")
+formulas <- list("sperm_length_log_mean ~ Rec_binary",
+                 "sperm_length_log_mean ~ bristle_binary",
+                 "sperm_length_log_mean ~ an_binary",
+                 "sperm_length_log_mean ~ inferred_syndrome_2states")
+N = "sperm_length_log_N"
+N_var = "~1/sperm_length_log_N"
+dependent_var = "sperm_length_log_mean"
+cor_form = "~ Short"
+```
+
+### Setup ouput lists
+
+```{r}
+main_res  <-  list()
+main_res_fits <- list()
+main_res_models <- list()
+```
+
+### Model comparison using ML
+
+```{r}
+for (i in 1:length(formulas)){
+  for (j in 1:ltre){
+    predictor <- pred_name[[i]]
+    df <- main_df
+    if(FILTER == TRUE){
+      df <- filter(main_df, inferred_syndrome_2states == syndrome)
+    }
+    comp_df <- df %>%
+      select(Short, preds[[i]], dependent_var, N) %>%
+      as.data.frame() %>%
+      prepare_phyl_pca(tree = trees[[j]], treename = "Short")
+    
+    BM <- gls(as.formula(formulas[[i]]),
+              data = comp_df[[1]], 
+              correlation = corBrownian(1,
+                                        phy=comp_df[[2]],
+                                        form = as.formula(cor_form)), 
+              weight = as.formula(N_var), method = "ML")
+    
+    lambda <- tryCatch(
+      {gls(as.formula(formulas[[i]]),
+           data = comp_df[[1]],
+           correlation = corPagel(1,
+                                  phy=comp_df[[2]],
+                                  form = as.formula(cor_form)),
+           weight = as.formula(N_var), method = "ML",
+           control=list(maxIter=500))},
+      error=function(cond){
+        
+        print(cond)
+        
+        optimal_lambda <- optimize_lambda(
+          formula=as.formula(formulas[[i]]),
+          data = comp_df[[1]],
+          phy=comp_df[[2]],
+          weight = as.formula(N_var),
+          method = "ML",
+          form = as.formula(cor_form),
+          control=list())
+        
+        gls(as.formula(formulas[[i]]),
+            data = comp_df[[1]], 
+            correlation = corPagel(optimal_lambda, 
+                                   phy=comp_df[[2]],
+                                   fixed=TRUE,
+                                   form = as.formula(cor_form)), 
+            weight = as.formula(N_var),
+            method = "ML",
+            control=list(maxIter=500))
+      }
+    )
+    
+    # limit lambda to 0 - 1
+    if(lambda$modelStruct[[1]] < 0){
+      lambda <- gls(as.formula(formulas[[i]]),
+                    data = comp_df[[1]], 
+                    correlation = corPagel(0, 
+                                           phy=comp_df[[2]],
+                                           form = as.formula(cor_form),
+                                           fixed=TRUE), 
+                    weight = as.formula(N_var), method = "ML",
+                    control=list(maxIter=500))
+    } else if (lambda$modelStruct[[1]] > 1){
+      # this means it is a BM model
+      lambda <- gls(as.formula(formulas[[i]]),
+                    data = comp_df[[1]], 
+                    correlation = corPagel(1, 
+                                           phy=comp_df[[2]], 
+                                           form = as.formula(cor_form), 
+                                           fixed=TRUE), 
+                    weight = as.formula(N_var),
+                    method = "ML",
+                    control=list(maxIter=500)) 
+    }
+    # convergence issues
+    OU <- tryCatch(
+      {gls(as.formula(formulas[[i]]),
+           data = comp_df[[1]],
+           correlation = corMartins(1,
+                                    phy=comp_df[[2]],
+                                    form = as.formula(cor_form)),
+           weight = as.formula(N_var),
+           method = "ML",
+           control=list(maxIter=500))},
+      error=function(cond){
+        
+        print(cond)
+        optimal_alpha <- optimize_alpha(
+          formula = as.formula(formulas[[i]]),
+          data = comp_df[[1]],
+          phy=comp_df[[2]],
+          weight = as.formula(N_var),
+          method = "ML",
+          form = as.formula(cor_form),
+          control=list())
+        
+        gls(as.formula(formulas[[i]]),
+            data = comp_df[[1]], 
+            correlation = corMartins(optimal_alpha, 
+                                     phy=comp_df[[2]],
+                                     form = as.formula(cor_form),
+                                     fixed=TRUE), 
+            weight = as.formula(N_var),
+            method = "ML",
+            control = list(maxIter=500))
+      })
+    ############
+    # Summarise fits and calculate AICc
+    models <- list(BM=BM,lambda=lambda,OU=OU)
+    fits <- data.frame(rbind(AICc_pgls_nlme(BM),
+                             AICc_pgls_nlme(lambda), AICc_pgls_nlme(OU)))
+    fits$predictor <- predictor
+    fits$model <-  c("BM", "lambda", "OU")
+    fits$tree <- names(trees)[[j]]
+    fits$N <- BM$dims$N
+    fits$modelPar <- round(
+      as.numeric(c(NA, lambda$modelStruct[[1]], OU$modelStruct[[1]])),2)
+    # Models where optimization failed will be ignored
+    fits$AIC <- ifelse(fits$AIC == -Inf, NA, fits$AIC)
+    fits$AICc <- ifelse(fits$AICc == -Inf, NA, fits$AICc)
+    # look at the results of the best fitting model
+    best_fit <- na.omit(fits$model[fits$AICc == min(fits$AICc, na.rm = TRUE)])
+    # if lambda is 1 then BM and lambda will be the same model
+    # we can then choose lambda to display
+    if(length(best_fit) > 1 & sum(best_fit == c("BM", "lambda")) == 2) {
+      best_fit = "lambda"
+    }
+    out_fits <- fits %>%
+      select(predictor, tree, N, model, modelPar, AIC, AICc)
+    ############
+    main_res_fits <- append(main_res_fits,list(out_fits))
+    
+  }
+}
+```
+
+### Output ML Fits
+
+```{r}
+
+write.csv(do.call(rbind, main_res_fits),
+          file=paste0("output/PGLS_",outname,"_weighted_fit.csv"))
+```
+
+### Fit models using REML
+
+```{r}
+for (i in 1:length(formulas)){
+for (j in 1:ltre){
+  predictor <- pred_name[[i]]
+  df <- main_df
+  if(FILTER == TRUE){
+    df <- filter(main_df, inferred_syndrome_2states == syndrome)
+  }
+  comp_df <- df %>%
+    select(Short, preds[[i]],
+           dependent_var, N
+           ) %>%
+  as.data.frame() %>%
+  prepare_phyl_pca(tree = trees[[j]], treename = "Short")
+  
+  
+  lambda <- tryCatch(
+    {gls(as.formula(formulas[[i]]), data = comp_df[[1]], 
+                 correlation = corPagel(1, phy=comp_df[[2]], form = ~Short), 
+                 weight = as.formula(N_var), method = "REML",
+                control=list(maxIter=500))},
+    error=function(cond){
+      print(cond)
+      optimal_lambda <- optimize_lambda(
+        formula=as.formula(formulas[[i]]), data = comp_df[[1]], phy=comp_df[[2]],
+        weight = as.formula(N_var), method = "REML", control=list())
+      gls(as.formula(formulas[[i]]), data = comp_df[[1]], 
+                 correlation = corPagel(optimal_lambda, 
+                                        phy=comp_df[[2]], form = ~Short, fixed=TRUE), 
+                 weight = as.formula(N_var), method = "REML",
+                 control=list(maxIter=500))})
+  
+  # limit lambda to 0 - 1
+  if(lambda$modelStruct[[1]] < 0){
+    lambda <- gls(as.formula(formulas[[i]]), data = comp_df[[1]], 
+                 correlation = corPagel(0, phy=comp_df[[2]], form = ~Short, fixed=TRUE), 
+                 weight = as.formula(N_var), method = "REML",
+                 control=list(maxIter=500))
+  } else if (lambda$modelStruct[[1]] > 1){
+    # this means it is a BM model
+     lambda <- gls(as.formula(formulas[[i]]), data = comp_df[[1]], 
+                 correlation = corPagel(1, phy=comp_df[[2]], form = ~Short, fixed=TRUE), 
+                 weight = as.formula(N_var), method = "REML",
+                 control=list(maxIter=500)) 
+  }
+
+  corStructure = lambda$modelStruct[[1]]
+  mod0 <- gls(as.formula("sperm_length_log_mean ~ 1"), data = comp_df[[1]], 
+                 correlation = corPagel(1,
+                                        phy=comp_df[[2]], form = ~Short),
+                 weight = as.formula(N_var), method = "REML",
+                control=list(maxIter=500))
+  
+  full =   lambda 
+  phy_only = mod0
+  data_only = lm(as.formula(formulas[[i]]), data = comp_df[[1]])
+  R2_pred_data = round(R2.pred(full, phy_only),3)
+  R2_pred_phy = round(R2.pred(full, data_only),3)
+  R2_pred_full = round(R2.pred(full),3)
+  
+  #####################
+  s_best <- summary(lambda)
+  res_df <- data.frame(s_best$tTable)
+  res_df$Estimate <- rownames(s_best$tTable)
+  res_df$model <- "lambda"
+  res <- res_df
+  res$R2pred <- c(R2_pred_full, rep(R2_pred_data, nrow(res)-1))
+  
+  res$predictor = pred_name[[i]]
+  res$phylogeny = names(trees)[[j]]
+  res$lambda = lambda$modelStruct[[1]]
+  res$N = nrow(comp_df[[1]])
+  #############
+  # DIAGNOSTICS
+  if (DIAGNOSTIC == TRUE) {
+    png(paste0("fig/diag/",outname, "_", names(trees)[j],"_",preds[i],".png"),
+      width = 7, height = 7, unit="in", res = 300)
+    pgls_diag_gls(name=paste0(names(trees)[j]," ",predictor), mod_type = "lambda",
+                model=lambda, formula=as.formula(formulas[[i]]),
+                data = comp_df[[1]], phy=comp_df[[2]], 
+                weight = as.formula(N_var), method = "REML", control=list(maxIter=500, opt="optim"))
+    dev.off()
+  }
+
+  ############
+  main_res <- append(main_res,list(res))
+  main_res_models <- append(main_res_models, list(lambda))
+}
+}
+
+main_res <- do.call(rbind, main_res)
+main_res$p.value <- format.pval(main_res$p.value, eps=0.001, digits=2)
+main_res_out <- main_res %>%
+  select(predictor, phylogeny, Estimate, N, lambda, Value, Std.Error, t.value, p.value, R2pred) %>%
+  mutate_if(is.numeric, round, 2)
+```
+
+### Output Table and Models
+
+```{r}
+write.csv(main_res_out, file=paste0("output/PGLS_",outname,"_weighted_PGLS.csv"))
+
+names(main_res_models) <- apply(expand.grid(names(trees), preds), 1, paste, collapse="_")
+saveRDS(main_res_models, paste0("output/PGLS_", outname,"_weighted_PGLS.RDS"))
+```
+
+
+## Plotting sperm length 
+
+This is a combination of the plot in the main Figure and the Supplement.
+
+```{r}
+list("sperm_length_log_mean ~ Rec_binary",
+     "sperm_length_log_mean ~ bristle_binary",
+     "sperm_length_log_mean ~ an_binary",
+     "sperm_length_log_mean ~ inferred_syndrome_2states")
+s <- c(seq(30,60,10),80,100,120,140)
+w <- 0.01
+ann_size = 4
+f = 2.4
+t = 2.2
+
+plot_df <- main_df
+
+
+rows <-  main_res_out$predictor == "received sperm binary" &
+  main_res_out$phylogeny == "C-IQ-TREE" 
+
+r_df <- main_res_out[rows,]
+
+lab <- c(
+  bquote(N==.(r_df[1,4])),
+  bquote(lambda==.(r_df[1,5])),
+  bquote(beta==.(r_df[2,6])),
+  bquote(t==.(r_df[2,8])),
+  bquote(p~.(r_df[2,9])),
+  bquote(R[pred]^2==.(r_df[1,10]))
+)
+
+p_Rec_binary <- ggplot(main_df[main_df$Rec_binary %in% c(0,1), ],
+                       aes(x=Rec_binary, y = sperm_length_log_mean)) + 
+  geom_boxplot(aes(fill= factor(Rec_binary))) +
+  geom_jitter(height=0, width=0.01, size=3, color="grey30") +
+  scale_fill_manual(values=palette3) + 
+  scale_x_discrete(labels=c("hypodermic", "antrum only")) +
+  scale_y_continuous(breaks = log10(s), label=s) +
+  xlab("Received sperm location") +
+  ylab(expression("Sperm length"~(""*mu*"m"))) +
+  theme_cowplot() +
+  theme(legend.position = "none") + 
+  annotate("text",
+           x = 0.6,
+           y = seq(from = f, to = t, length.out = length(lab)),
+           label = lab ,
+           parse = TRUE,
+           size = ann_size,
+           hjust = 0)
+
+
+p_Rec_binary 
+
+
+rows <-  main_res_out$predictor == "bristle state binary" &
+  main_res_out$phylogeny == "C-IQ-TREE" 
+
+r_df <- main_res_out[rows,]
+
+lab <- c(
+  bquote(N==.(r_df[1,4])),
+  bquote(lambda==.(r_df[1,5])),
+  bquote(beta==.(r_df[2,6])),
+  bquote(t==.(r_df[2,8])),
+  bquote(p~.(r_df[2,9])),
+  bquote(R[pred]^2==.(r_df[1,10]))
+)
+
+p_bristle_binary <- ggplot(main_df[main_df$bristle_binary %in% c(0,1), ],
+                       aes(x=factor(bristle_binary), y = sperm_length_log_mean)) + 
+  geom_boxplot(aes(fill= factor(bristle_binary))) +
+  geom_jitter(height=0, width=w, size=3, color="grey30") +
+  scale_fill_manual(values=palette3) + 
+  scale_x_discrete(labels=c("absent/reduced", "present")) +
+  scale_y_continuous(breaks = log10(s), label=s) +
+  xlab("Bristle state") +
+  ylab(expression("Sperm length"~(""*mu*"m"))) +
+  theme_cowplot() +
+  theme(legend.position = "none") + 
+  annotate("text",
+           x = 0.6,
+           y = seq(from = f, to = t, length.out = length(lab)),
+           label = lab ,
+           parse = TRUE,
+           size = ann_size,
+           hjust = 0)
+
+
+# antrum
+
+rows <-  main_res_out$predictor == "antrum binary" &
+  main_res_out$phylogeny == "C-IQ-TREE" 
+
+r_df <- main_res_out[rows,]
+
+lab <- c(
+  bquote(N==.(r_df[1,4])),
+  bquote(lambda==.(r_df[1,5])),
+  bquote(beta==.(r_df[2,6])),
+  bquote(t==.(r_df[2,8])),
+  bquote(p~.(r_df[2,9])),
+  bquote(R[pred]^2==.(r_df[1,10]))
+)
+
+p_an_binary <- main_df[main_df$an_binary %in% c(0, 1), ] %>% 
+  mutate(an_binary = factor(an_binary, levels=c(0, 1))) %>% 
+           ggplot(aes(x = an_binary, y = sperm_length_log_mean)) + 
+  geom_boxplot(aes(fill=an_binary), outlier.shape = NA) +
+  geom_jitter(height=0, width=0.01, size=3, color="grey30") +
+  scale_fill_manual(values=palette3) + 
+  scale_x_discrete(labels=c("thin", "thickened")) +
+  scale_y_continuous(breaks = log10(s), label=s) +
+  xlab("Antrum type") +
+  ylab(expression("Sperm length"~(""*mu*"m"))) +
+  theme_cowplot() +
+  theme(legend.position = "none") + 
+  annotate("text",
+           x = 0.6,
+           y = seq(from = f, to = t, length.out = length(lab)),
+           label = lab ,
+           parse = TRUE,
+           size = ann_size,
+           hjust = 0)
+
+
+# syndrome
+rows <-  main_res_out$predictor == "inferred syndrome binary" &
+  main_res_out$phylogeny == "C-IQ-TREE" 
+
+r_df <- main_res_out[rows,]
+
+lab <- c(
+  bquote(N==.(r_df[1,4])),
+  bquote(lambda==.(r_df[1,5])),
+  bquote(beta==.(r_df[2,6])),
+  bquote(t==.(r_df[2,8])),
+  bquote(p~.(r_df[2,9])),
+  bquote(R[pred]^2==.(r_df[1,10]))
+)
+
+
+p_inferred_syndrome_binary <- main_df[main_df$inferred_syndrome_2states %in% c("hypodermic","reciprocal"),] %>%
+  ggplot(aes(x=inferred_syndrome_2states,y = sperm_length_log_mean)) + 
+  geom_boxplot(aes(fill= inferred_syndrome_2states), outlier.shape = NA) +
+  geom_jitter(height=0, width=w, size=3, color="grey30") +
+  scale_fill_manual(values=palette3) + 
+  scale_y_continuous(breaks = log10(s), label=s) +
+  xlab("Inferred syndrome") +
+  ylab(expression("Sperm length"~(""*mu*"m"))) +
+  theme_cowplot() +
+  theme(legend.position = "none") + 
+  annotate("text",
+           x = 0.6,
+           y = seq(from = f, to = t, length.out = length(lab)),
+           label = lab ,
+           parse = TRUE,
+           size = ann_size,
+           hjust = 0)
+
+p_inferred_syndrome_binary_main <- main_df[main_df$inferred_syndrome_2states %in% c("hypodermic","reciprocal"),] %>%
+  ggplot(aes(x=inferred_syndrome_2states,y = sperm_length_log_mean)) + 
+  geom_boxplot(aes(fill= inferred_syndrome_2states), outlier.shape = NA, width = 0.4) +
+  geom_jitter(height=0, width=w, size=3, color="grey30") +
+  scale_fill_manual(values=palette3) + 
+  scale_y_continuous(breaks = log10(s), label=s) +
+  xlab("Inferred syndrome") +
+  ylab(expression("Sperm length"~(""*mu*"m"))) +
+  theme_cowplot() +
+  theme(legend.position = "none") + 
+  annotate("text",
+           x = 0.6,
+           y = seq(from = f, to = t, length.out = length(lab)),
+           label = lab ,
+           parse = TRUE,
+           size = ann_size,
+           hjust = 0)
+
+
+
+
+
+pdf("fig/sperm_length_boxplot_PGLS.pdf", width=14, useDingbats = FALSE)
+plot_grid(p_Rec_binary,p_bristle_binary, p_an_binary, p_inferred_syndrome_binary, nrow=1,
+          labels = c("A", "B", "C", "D"), label_size = 20)
+dev.off()
+
+pdf("fig/sperm_length_boxplot_PGLS_supplement.pdf", width=11, useDingbats = FALSE)
+plot_grid(p_Rec_binary,p_bristle_binary, p_an_binary, nrow=1,
+          labels = c("A", "B", "C"), label_size = 20)
+dev.off()
+
+
+pdf("fig/sperm_length_boxplot_PGLS_main.pdf", width=3, useDingbats = FALSE)
+plot_grid(p_inferred_syndrome_binary_main, nrow=1)
+dev.off()
+
+```
+
+
+## Including body size as a covariate
+
+### Setup formulas and switches
+
+```{r}
+outname <- "EL_sperm_length_body_size"
+FILTER = FALSE
+DIAGNOSTIC = FALSE
+#syndrome = "hypodermic"
+
+pred_name <- list("received sperm binary",
+                  "bristle state binary",
+                  "antrum binary",
+                  "inferred syndrome binary")
+preds <- list("Rec_binary",
+              "bristle_binary",
+              "an_binary",
+              "inferred_syndrome_2states")
+formulas <- list("sperm_length_log_mean ~ Rec_binary + body_size_logsqrt_mean",
+                 "sperm_length_log_mean ~ bristle_binary + body_size_logsqrt_mean",
+                 "sperm_length_log_mean ~ an_binary + body_size_logsqrt_mean",
+                 "sperm_length_log_mean ~ inferred_syndrome_2states + body_size_logsqrt_mean")
+N = "sperm_length_log_N"
+N_var = "~1/sperm_length_log_N"
+dependent_var = "sperm_length_log_mean"
+cor_form = "~ Short"
+```
+
+### Setup ouput lists
+
+```{r}
+body_res  <-  list()
+body_res_fits <- list()
+body_res_models <- list()
+```
+
+
+```{r}
+### Fit models using REML
+
+for (i in 1:length(formulas)){
+for (j in 1:ltre){
+  predictor <- pred_name[[i]]
+  df <- main_df
+  if(FILTER == TRUE){
+    df <- filter(main_df, inferred_syndrome_2states == syndrome)
+  }
+  comp_df <- df %>%
+    select(Short, preds[[i]],
+           dependent_var, N, body_size_logsqrt_mean
+           ) %>%
+  as.data.frame() %>%
+  prepare_phyl_pca(tree = trees[[j]], treename = "Short")
+  
+  
+  lambda <- tryCatch(
+    {gls(as.formula(formulas[[i]]), data = comp_df[[1]], 
+                 correlation = corPagel(1, phy=comp_df[[2]], form = ~Short), 
+                 weight = as.formula(N_var), method = "REML",
+                control=list(maxIter=500))},
+    error=function(cond){
+      print(cond)
+      optimal_lambda <- optimize_lambda(
+        formula=as.formula(formulas[[i]]), data = comp_df[[1]], phy=comp_df[[2]],
+        weight = as.formula(N_var), method = "REML", control=list())
+      gls(as.formula(formulas[[i]]), data = comp_df[[1]], 
+                 correlation = corPagel(optimal_lambda, 
+                                        phy=comp_df[[2]], form = ~Short, fixed=TRUE), 
+                 weight = as.formula(N_var), method = "REML",
+                 control=list(maxIter=500))})
+  
+  # limit lambda to 0 - 1
+  if(lambda$modelStruct[[1]] < 0){
+    lambda <- gls(as.formula(formulas[[i]]), data = comp_df[[1]], 
+                 correlation = corPagel(0, phy=comp_df[[2]], form = ~Short, fixed=TRUE), 
+                 weight = as.formula(N_var), method = "REML",
+                 control=list(maxIter=500))
+  } else if (lambda$modelStruct[[1]] > 1){
+    # this means it is a BM model
+     lambda <- gls(as.formula(formulas[[i]]), data = comp_df[[1]], 
+                 correlation = corPagel(1, phy=comp_df[[2]], form = ~Short, fixed=TRUE), 
+                 weight = as.formula(N_var), method = "REML",
+                 control=list(maxIter=500)) 
+  }
+
+  corStructure = lambda$modelStruct[[1]]
+  mod0 <- gls(as.formula("sperm_length_log_mean ~ 1"), data = comp_df[[1]], 
+                 correlation = corPagel(1,
+                                        phy=comp_df[[2]], form = ~Short),
+                 weight = as.formula(N_var), method = "REML",
+                control=list(maxIter=500))
+  
+  full =   lambda 
+  phy_only = mod0
+  data_only = lm(as.formula(formulas[[i]]), data = comp_df[[1]])
+  R2_pred_data = round(R2.pred(full, phy_only),3)
+  R2_pred_phy = round(R2.pred(full, data_only),3)
+  R2_pred_full = round(R2.pred(full),3)
+  
+  #####################
+  s_best <- summary(lambda)
+  res_df <- data.frame(s_best$tTable)
+  res_df$Estimate <- rownames(s_best$tTable)
+  res_df$model <- "lambda"
+  res <- res_df
+  res$R2pred <- c(R2_pred_full, rep(R2_pred_data, nrow(res)-1))
+  
+  res$predictor = pred_name[[i]]
+  res$phylogeny = names(trees)[[j]]
+  res$lambda = lambda$modelStruct[[1]]
+  res$N = nrow(comp_df[[1]])
+  #############
+  # DIAGNOSTICS
+  if (DIAGNOSTIC == TRUE) {
+    png(paste0("fig/diag/",outname, "_", names(trees)[j],"_",preds[i],".png"),
+      width = 7, height = 7, unit="in", res = 300)
+    pgls_diag_gls(name=paste0(names(trees)[j]," ",predictor), mod_type = "lambda",
+                model=lambda, formula=as.formula(formulas[[i]]),
+                data = comp_df[[1]], phy=comp_df[[2]], 
+                weight = as.formula(N_var), method = "REML", control=list(maxIter=500, opt="optim"))
+    dev.off()
+  }
+
+  ############
+  body_res <- append(body_res,list(res))
+  body_res_models <- append(body_res_models, list(lambda))
+}
+}
+
+body_res <- do.call(rbind, body_res)
+body_res$p.value <- format.pval(body_res$p.value, eps=0.001, digits=2)
+body_res_out <- body_res %>%
+  select(predictor, phylogeny, Estimate, N, lambda, Value, Std.Error, t.value, p.value, R2pred) %>%
+  mutate_if(is.numeric, round, 2)
+```
+
+```{r}
+write.csv(body_res_out, file=paste0("output/PGLS_",outname,"_weighted_PGLS.csv"))
+
+names(body_res_models) <- apply(expand.grid(names(trees), preds), 1, paste, collapse="_")
+saveRDS(body_res_models, paste0("output/PGLS_", outname,"_weighted_PGLS.RDS"))
+```
+
+
+
+
+
+

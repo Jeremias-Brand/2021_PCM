@@ -1,0 +1,2465 @@
+---
+title: "ASR.Rmd"
+author: "Jeremias N. Brand"
+output: html_document
+---
+
+
+```{r setup, include=FALSE, echo=FALSE}
+require("knitr")
+opts_knit$set(root.dir = "..")
+```
+
+```{r message=FALSE, results="hide", warning=FALSE}
+source("R/functions.R")
+# pacman::p_load(ape, phytools, phangorn, purrr, tidyr, dplyr, ggplot2, ggtree, hisse, RColorBrewer, readxl, lattice, writexl, grid, gridExtra, gtable, ggstance))
+pkg <- c("ape", "phytools", "phangorn", "purrr", "cowplot", "tidyr", "dplyr", "ggplot2", "ggtree", "hisse", "RColorBrewer", "readxl", "lattice", "writexl", "grid", "gridExtra", "gtable", "ggstance", "ggnewscale", "foreach")
+lapply(pkg, require, character.only = TRUE)
+
+```
+
+General parameters and functions
+
+```{r}
+get_orderd_trait  <- function(t,df,var,treename) {
+  order <- match(t$tip.label, df[,treename])
+  trait <- as.character(df[order,var])
+  names(trait) <- df[order,treename]
+  trait <- ifelse(is.na(trait), "no observation", trait)
+  return(trait)
+}
+
+get_pies_trait <- function(trait, palette){
+  cols<-setNames(palette[1:length(unique(trait))], sort(unique(trait)))
+  return(list(to.matrix(trait, sort(unique(trait))), cols))
+}
+# palette1 <- c("black", "grey", "white", "coral")
+# palette2 <- c("white", "grey", "black", "coral")
+# palette3 <- c("white", "black", "coral")
+
+palette1 <- c("blue", "lightblue", "black", "grey")
+palette2 <- c("black", "lightblue", "blue", "grey")
+palette3 <- c("black", "blue", "grey")
+
+pr = "#006837"
+int = "#78c679"
+ab = "#ffffcc"
+
+palette1 <- c(pr, int, ab, "grey")
+palette2 <- c(ab, int, pr, "grey")
+palette3 <- c(ab, pr, "grey")
+
+### SIMMAP SWITCH
+# Turn this on if you want to run stochastic mapping.
+# This will take about a day to run if you turn this switch on.
+run_simmap=FALSE
+
+cil = 0.025
+cih = 0.975
+simmap_all_results <- data.frame(Trait=NA, Tree=NA, sp_in_tree=NA,
+                                 N_ch=NA, N_ch_l95=NA, N_ch_h95=NA,
+                                 X0.1=NA, X0.1_l95=NA, X0.1_h95=NA,
+                                 X1.0=NA, X1.0_l95=NA, X1.0_h95=NA,
+                                 root0=NA,root1=NA)
+
+simmap_3_results <- data.frame(Trait=NA, Tree=NA, sp_in_tree=NA,
+                                 N_ch=NA, N_ch_l95=NA, N_ch_h95=NA,
+                                 X0.1=NA, X0.1_l95=NA, X0.1_h95=NA,
+                                 X1.0=NA, X1.0_l95=NA, X1.0_h95=NA,
+                                 X1.2=NA, X1.2_l95=NA, X1.2_h95=NA,
+                                 X2.1=NA, X2.1_l95=NA, X2.1_h95=NA,
+                                 X0.2=NA, X0.2_l95=NA, X0.2_h95=NA,
+                                 X2.0=NA, X2.0_l95=NA, X2.0_h95=NA,
+                                 root0=NA, root1=NA, root2=NA)
+
+names_simmap_3 <-  names(simmap_3_results)
+
+
+model_comp_template <- data.frame(trait=NA, tree=NA, model=NA,
+                                 dfs=NA, Log.lik=NA, AICc=NA,
+                                 deltaAICc=NA, AICcweights=NA)
+
+nsim=1000
+burnin=1000
+samplefreq=10
+Nclusters=3
+```
+
+
+Prep for parallel runs:
+
+```{r}
+cl <- parallel::makeCluster(Nclusters)
+doParallel::registerDoParallel(cl)
+library(foreach)
+```
+
+
+## Load data
+
+```{r}
+morpho_df <- readxl::read_excel("Tab_S2.xlsx", sheet = 2, na = c("","NA"),
+                                 col_types = c("text", "text", rep("numeric",8)))
+
+
+species_df <- readxl::read_excel("Tab_S3.xlsx", sheet = 2, na = c("","NA"),
+                                  col_types = c(
+                                    rep("text",5),
+                                    rep("numeric",10),
+                                    "text",
+                                    rep("numeric",12),
+                                    "text"
+                                    )
+                                 )
+```
+
+## LOAD TREES
+
+```{r}
+trees <- readRDS(file = paste0("trees.Rdata"))
+ltre <- length(trees)
+```
+
+## ANCESTRAL STATE RECONSTRUCTION FOR RECEIVED SPERM, BRISTLE STATE, ANTRUM
+
+```{r}
+df <- species_df %>% 
+  mutate(sci_name_short = gsub(" ", "_", gsub("Macrostomum", "M.", Species)),
+         inferred_syndrome_2states = case_when(
+           inferred_syndrome == "intermediate" ~ "hypodermic",
+           TRUE ~ inferred_syndrome
+         )) %>%
+  select(sci_name_short, Short, Rec, Rec_binary, bristle, bristle_binary, contains("an_"), inferred_syndrome, inferred_syndrome_2states, sharp)%>%
+  mutate(sharp = as.factor(sharp)) %>%
+  mutate(taxa = sci_name_short) %>%
+  as.data.frame()
+```
+
+
+```{r}
+par(mfrow=c(1,3))
+
+for (i in c(1,3)){
+pdf(paste0("fig/05_traits_plotted_",names(trees)[[i]],".pdf"),
+    height = 30, width = 13, useDingbats=FALSE)
+t <- trees[[i]]
+# drop tips with no information (outgroup)
+drop <- t$tip.label[!t$tip.label %in% df$Short]
+t <-  drop.tip(t, drop)
+t$tip.label <- df$sci_name_short[match(t$tip.label, df$Short)]
+trait1 <- get_orderd_trait(t=t, df=df, var="Rec", treename="sci_name_short")
+pies1 <- get_pies_trait(trait1, palette1)
+
+trait2 <- get_orderd_trait(t=t, df=df, var="bristle", treename="sci_name_short")
+pies2 <- get_pies_trait(trait2, palette2)
+
+trait3 <- get_orderd_trait(t=t, df=df, var="an_binary", treename="sci_name_short")
+pies3 <- get_pies_trait(trait3, palette3)
+
+trait4 <- get_orderd_trait(t=t, df=df, var="inferred_syndrome", treename="sci_name_short")
+pies4 <- get_pies_trait(trait4, palette2)
+
+trait5 <- get_orderd_trait(t=t, df=df, var="sharp", treename="sci_name_short")
+pies5 <- get_pies_trait(trait5, palette1)
+
+t$tip.label <- gsub(" ", "_", t$tip.label)
+plot.phylo(t,type = "phylogram",label.offset = 0.1, mar = c(0,0,0,0), cex = 0.8,
+           edge.width = 2,
+           x.lim=c(0,1), y.lim=c(1,145))
+tiplabels(pie = pies1[[1]], piecol = pies1[[2]], cex = 0.35, adj = c(0.52, 0.5))
+tiplabels(pie = pies2[[1]], piecol = pies2[[2]], cex = 0.35, adj = c(0.54, 0.5))
+tiplabels(pie = pies3[[1]], piecol = pies3[[2]], cex = 0.35, adj = c(0.56, 0.5))
+tiplabels(pie = pies4[[1]], piecol = pies4[[2]], cex = 0.35, adj = c(0.58, 0.5))
+
+
+title(main = "Rec|bristle|an_binary|inferred_syndrome", outer = F, cex = 4) 
+
+piesize=0.3
+first_support <- sapply(strsplit(t$node.label, "/"), "[", 1)
+first_support_low <- round(ifelse(as.numeric(first_support) <= 95, as.numeric(first_support), NA))
+second_support <- sapply(strsplit(t$node.label, "/"), "[", 2)
+second_support_low <- round(ifelse(as.numeric(second_support) <= 95, as.numeric(second_support), NA))
+
+sup_df <- as.data.frame(cbind(as.numeric(first_support), as.numeric(second_support)))
+sup_df <- sup_df %>%
+  mutate(A = case_when(
+    V1 > 95 & V2 > 95 ~ 0.5,
+    V1 > 95 ~ 1,
+    V2 > 95 ~ 0,
+    TRUE ~ NA_real_
+    ),
+    B = case_when(
+    V1 > 95 & V2 > 95 ~ 0.5,
+    V1 > 95 ~ 0,
+    V2 > 95 ~ 1,
+    TRUE ~ NA_real_
+    )
+  )
+
+nodelabels(node = 1:t$Nnode + Ntip(t),
+           pie = as.matrix(sup_df[,3:4]),
+           piecol = c("black", "grey"), cex = piesize)
+nodelabels(node = 1:t$Nnode + Ntip(t),
+           text = first_support_low, cex = piesize + 0.5, adj = c(1.1, -0.2), frame = "none", font = 3)
+nodelabels(node = 1:t$Nnode + Ntip(t),
+           text = second_support_low, cex = piesize + 0.5, adj = c(1.1, 1.2), frame = "none", font = 3)
+
+add.scale.bar( length = 0.2, ask = FALSE,
+              lwd = 3, lcol = "black")
+
+dev.off()
+
+## 
+
+pdf(paste0("fig/05_traits_plotted_dense_",names(trees)[[i]],".pdf"),
+    height = 30, width = 8, useDingbats=FALSE)
+
+tip_size=0.63
+plot.phylo(t,type = "phylogram",label.offset = 0.4, mar = c(0,0,0,0), cex = 0.8,
+           edge.width = 2,
+           x.lim=c(0,1.8), y.lim=c(1,145))
+tiplabels(pie = pies1[[1]], piecol = pies1[[2]], cex = tip_size, adj = c(0.52, 0.5))
+tiplabels(pie = pies2[[1]], piecol = pies2[[2]], cex = tip_size, adj = c(0.57, 0.5))
+tiplabels(pie = pies3[[1]], piecol = pies3[[2]], cex = tip_size, adj = c(0.62, 0.5))
+
+tiplabels(pie = pies5[[1]], piecol = pies5[[2]], cex = tip_size, adj = c(0.67, 0.5))
+tiplabels(pie = pies4[[1]], piecol = pies4[[2]], cex = tip_size, adj = c(0.72, 0.5))
+
+title(main = "Rec|bristle|an_binary|sharp|inferred_syndrome", outer = F, cex = 4) 
+
+piesize=0.3
+first_support <- sapply(strsplit(t$node.label, "/"), "[", 1)
+first_support_low <- round(ifelse(as.numeric(first_support) <= 95, as.numeric(first_support), NA))
+second_support <- sapply(strsplit(t$node.label, "/"), "[", 2)
+second_support_low <- round(ifelse(as.numeric(second_support) <= 95, as.numeric(second_support), NA))
+
+sup_df <- as.data.frame(cbind(as.numeric(first_support), as.numeric(second_support)))
+sup_df <- sup_df %>%
+  mutate(A = case_when(
+    V1 > 95 & V2 > 95 ~ 0.5,
+    V1 > 95 ~ 1,
+    V2 > 95 ~ 0,
+    TRUE ~ NA_real_
+    ),
+    B = case_when(
+    V1 > 95 & V2 > 95 ~ 0.5,
+    V1 > 95 ~ 0,
+    V2 > 95 ~ 1,
+    TRUE ~ NA_real_
+    )
+  )
+
+nodelabels(node = 1:t$Nnode + Ntip(t),
+           pie = as.matrix(sup_df[,3:4]),
+           piecol = c("black", "grey"), cex = piesize)
+nodelabels(node = 1:t$Nnode + Ntip(t),
+           text = first_support_low, cex = piesize + 0.5, adj = c(1.1, -0.2), frame = "none", font = 3)
+nodelabels(node = 1:t$Nnode + Ntip(t),
+           text = second_support_low, cex = piesize + 0.5, adj = c(1.1, 1.2), frame = "none", font = 3)
+
+add.scale.bar( length = 0.2, ask = FALSE,
+              lwd = 3, lcol = "black")
+
+dev.off()
+
+}
+```
+
+## Ancestral State Reconstruction Received sperm
+
+Rec is where sperm was found. Can be an (antrum only), hy (hypodermic only) and both (found hypodermic and in antrum).
+
+First we check which model should be preferred. for this we can't include missing data.
+
+We will perform the analysis for all trees and first find the MLE model using ace.
+
+I have enhanced the functions I have written to calculate AICc for all models and we can then use AIC weights calculate support for each model.
+
+```{r}
+MKs_Rec <- list()
+textoffset=0.025
+i1 = 1.6
+i2 = 2.1
+piesize=4
+pal = palette1
+plots=list()
+for (i in 1:ltre) {
+  t <- trees[[i]]
+  name <- names(trees)[i]
+  dfnew <- filter(df, !is.na(Rec)) %>% as.data.frame()
+  drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+  t <-  drop.tip(t, drop)
+  Rec <- get_orderd_trait(t=t, df=dfnew, var="Rec", treename="Short")
+  
+  MK_mod <- plot_MK(paste0("fig/05_MK_Rec_",name,".pdf"), Rec, t,cols=palette1)
+  MKs_Rec <- c(MKs_Rec,  setNames(list(MK_mod), name))
+}
+```
+
+### we also test if an ordered model fits well
+```{r}
+MKs_Rec_ord <- list()
+ordered_ARD <- matrix(c(0,2,0,
+                        1,0,4,
+                        0,3,0 ),3)
+MKs_Rec_nogain <- list()
+nogain_ARD <- matrix(c(0,3,0,
+                       1,0,0,
+                       2,4,0 ),3)
+
+# MKs_Rec_noloss <- list()
+# noloss_ARD <- matrix(c(0,1,3,
+#                          0,0,4,
+#                          0,2,0 ),3)
+
+MKs_nogain_ord<- list()
+nogain_ord <- matrix(c(0,2,0,
+                       1,0,0,
+                       0,3,0 ),3)
+
+for (i in 1:ltre) {
+  t <- trees[[i]]
+  name <- names(trees)[i]
+  dfnew <- filter(df, !is.na(Rec)) %>% as.data.frame()
+  drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+  t <-  drop.tip(t, drop)
+  Rec <- get_orderd_trait(t=t, df=dfnew, var="Rec", treename="Short")
+  
+  MK_mod <- plot_MK_onemod(paste0("fig/05_MK_Rec_simplest_",name,".pdf"), Rec, t, nogain_ord, cols=palette1)
+  MKs_nogain_ord <- c(MKs_nogain_ord,  setNames(list(MK_mod), name))
+  
+  MK_mod <- plot_MK_onemod(paste0("fig/05_MK_Rec_ordered_",name,".pdf"), Rec, t, ordered_ARD, cols=palette1)
+  MKs_Rec_ord <- c(MKs_Rec_ord,  setNames(list(MK_mod), name))
+  
+  MK_mod <- plot_MK_onemod(paste0("fig/05_MK_Rec_nogain_",name,".pdf"), Rec, t, nogain_ARD, cols=palette1)
+  MKs_Rec_nogain <- c(MKs_Rec_nogain,  setNames(list(MK_mod), name))
+  
+}
+```
+
+
+This function runs ace() with equal rates (ER), symmetrical rates (SYM) or with 
+all rates different(ARD). Let's see what this tells us:
+
+### MODEL Results
+
+```{r}
+for (i in 1:ltre) {
+  print(names(MKs_Rec)[i])
+  print(MKs_Rec[[i]]$fitER)
+  print(MKs_Rec[[i]]$fitSYM)
+  print(MKs_nogain_ord[[i]]$mod)
+  print(MKs_Rec_nogain[[i]]$mod)
+  print(MKs_Rec_ord[[i]]$mod)
+  print(MKs_Rec[[i]]$fitARD)
+}
+```
+
+There are no transition from hypodermic to both so the model can't estimate this rate!
+The ancestral state in these models is estimated to be "both".
+Let's see which one is preferred:
+
+```{r}
+model_names <- c("ER", "SYM", "ordered no gains", 
+                 "no gains", "ordered ARD", "ARD")
+model_comp_Rec3 <- model_comp_template
+for (i in 1:ltre) {
+AICc <- c(MKs_Rec[[i]]$fitER$aicc,
+        MKs_Rec[[i]]$fitSYM$aicc,
+        MKs_nogain_ord[[i]]$mod$aicc,
+        MKs_Rec_nogain[[i]]$mod$aicc,
+        MKs_Rec_ord[[i]]$mod$aicc,
+        MKs_Rec[[i]]$fitARD$aicc)
+
+dfs <- c(
+  length(MKs_Rec[[i]]$fitER$rates),
+  length(MKs_Rec[[i]]$fitSYM$rates),
+  length(MKs_nogain_ord[[i]]$mod$rates),
+  length(MKs_Rec_nogain[[i]]$mod$rates),
+  length(MKs_Rec_ord[[i]]$mod$rates),
+  length(MKs_Rec[[i]]$fitARD$rates)
+  )
+
+Log.lik <- c(
+  MKs_Rec[[i]]$fitER$loglik,
+  MKs_Rec[[i]]$fitSYM$loglik,
+  MKs_nogain_ord[[i]]$mod$loglik,
+  MKs_Rec_nogain[[i]]$mod$loglik,
+  MKs_Rec_ord[[i]]$mod$loglik,
+  MKs_Rec[[i]]$fitARD$loglik
+  )
+
+names(AICc) <- model_names
+deltaAICc <- AICc- min(AICc)
+AICcweights <- exp(-1/2 * deltaAICc)/sum(exp(-1/2 * deltaAICc))
+  
+comp <- as.data.frame(round(cbind(dfs,Log.lik,AICc,deltaAICc,AICcweights),3))
+comp$trait <- "received sperm (3 states)"
+comp$tree <- names(trees)[i]
+comp$model <- row.names(comp)
+comp <- comp[,c(6:8,1:5)]
+
+model_comp_Rec3 <- rbind(model_comp_Rec3, comp)
+}
+```
+
+
+Both the no gains and the ordered model are equally likely. Since our bayesian approach 
+does not look like a Dollo model we will use the ordered approach.
+
+The ordered model has fewer parameters and the ARD model can not be justified against it.
+
+I now calculate the ancestral states using SIMMAP
+
+# Simmaps of the best fitting model (nogain_ordered)
+
+```{r}
+if (run_simmap == TRUE){
+  simmaps_Rec_nogain_ord <- foreach(i = 1:ltre) %dopar% {
+      # we need libraries inside foreach
+      source("R/functions.R")
+      lapply(pkg, require, character.only = TRUE)
+      t <- trees[[i]]
+      name <- names(trees)[i]
+      print(name)
+      dfnew <- filter(df, !is.na(Rec)) %>% as.data.frame()
+      drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+      t <-  drop.tip(t, drop)
+      print(t)
+      Rec <- get_orderd_trait(t=t, df=dfnew, var="Rec", treename="Short")
+      Rec_simmap_mod <- plot_simmap_onemod(
+        paste0("fig/05_simmap_Rec_nogain_ord_", name, ".pdf"),
+        Rec, tree = t, nsim=nsim, burnin=burnin,
+        samplefreq=samplefreq, model = nogain_ord, cols = palette1,
+        piesize = 0.6, trans_tbl = df)
+      Rec_simmap_mod
+    }
+  # Save result to file:
+  saveRDS(simmaps_Rec_nogain_ord , "output/05_simmaps_Rec_nogain_ord.Rdata")
+}
+
+# Check if the file exists and load if not 
+if (!exists("simmaps_Rec_nogain_ord")){
+  print("loading Rdata file")
+  simmaps_Rec_nogain_ord <- readRDS("output/05_simmaps_Rec_nogain_ord.Rdata")
+}
+
+simmaps_Rec_nogain_ord <- setNames(simmaps_Rec_nogain_ord, names(trees))
+
+## Calculate credible interval for each sample
+simmap_Rec_results <- simmap_3_results
+
+traitName <- "Rec_nogain_ordered"
+for (i in 1:ltre) {
+  changes <- data.frame(simmaps_Rec_nogain_ord[[i]]$mod$count)
+  res <- c(traitName, names(trees)[[i]],
+           length(simmaps_Rec_nogain_ord[[i]]$trees[[1]]$tip.label),
+           mean(changes$N),quantile(changes$N, c(cil,cih)), 
+           mean(changes$hy.both), quantile(changes$hy.both, c(cil,cih)),
+           mean(changes$both.hy), quantile(changes$both.hy, c(cil,cih)),
+           mean(changes$both.an), quantile(changes$both.an, c(cil,cih)),
+           mean(changes$an.both), quantile(changes$an.both, c(cil,cih)),
+           mean(changes$hy.an), quantile(changes$hy.an, c(cil,cih)),
+           mean(changes$an.hy), quantile(changes$an.hy, c(cil,cih)),
+           simmaps_Rec_nogain_ord[[i]]$mod$ace[1,1],
+           simmaps_Rec_nogain_ord[[i]]$mod$ace[1,2],
+           simmaps_Rec_nogain_ord[[i]]$mod$ace[1,3])
+  names(res) <- names_simmap_3
+  simmap_Rec_results <- rbind(simmap_Rec_results, res)
+}
+
+# extract the Q matrix as well
+Q_Rec_nogain_ord <- as.data.frame(rbind(
+      extract_Q(simmaps_Rec_nogain_ord[[1]]$mod$tree),
+      extract_Q(simmaps_Rec_nogain_ord[[2]]$mod$tree),
+      extract_Q(simmaps_Rec_nogain_ord[[3]]$mod$tree)))
+Q_Rec_nogain_ord$tree <- rep(names(trees), each=3)
+Q_Rec_nogain_ord$MK_model <- "Rec_nogain_ord"
+```
+
+There are two additional models with some support: no gains and ordered ARD.
+I do simmap for those as well.
+
+```{r}
+if (run_simmap == TRUE){
+  simmaps_Rec_nogain_ARD <- foreach(i = 1:ltre) %dopar% {
+      # we need libraries inside foreach
+      source("R/functions.R")
+      lapply(pkg, require, character.only = TRUE)
+      t <- trees[[i]]
+      name <- names(trees)[i]
+      print(name)
+      dfnew <- filter(df, !is.na(Rec)) %>% as.data.frame()
+      drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+      t <-  drop.tip(t, drop)
+      print(t)
+      Rec <- get_orderd_trait(t=t, df=dfnew, var="Rec", treename="Short")
+      Rec_simmap_mod <- plot_simmap_onemod(
+        paste0("fig/05_simmap_Rec_nogain_ARD_", name, ".pdf"),
+        Rec, tree = t, nsim=nsim, burnin=burnin,
+        samplefreq=samplefreq, model = nogain_ARD, cols = palette1,
+        piesize = 0.6, trans_tbl = df)
+      Rec_simmap_mod
+    }
+  # Save result to file:
+  saveRDS(simmaps_Rec_nogain_ARD , "output/05_simmaps_Rec_nogain_ARD.Rdata")
+}
+
+
+# Check if the file exists and load if not 
+if (!exists("simmaps_Rec_nogain_ARD")){
+  simmaps_Rec_nogain_ARD  <- readRDS("output/05_simmaps_Rec_nogain_ARD.Rdata")
+}
+
+simmaps_Rec_nogain_ARD  <- setNames(simmaps_Rec_nogain_ARD , names(trees))
+
+par(mfrow=c(1,3))
+describe.simmap(simmaps_Rec_nogain_ARD[[1]]$trees, plot=TRUE)
+describe.simmap(simmaps_Rec_nogain_ARD[[2]]$trees, plot=TRUE)
+describe.simmap(simmaps_Rec_nogain_ARD[[3]]$trees, plot=TRUE)
+
+## Calculate credible interval for each sample
+traitName <- "Rec_nogain_ARD"
+for (i in 1:ltre) {
+  changes <- data.frame(simmaps_Rec_nogain_ARD[[i]]$mod$count)
+  res <- c(traitName, names(trees)[[i]], length(simmaps_Rec_nogain_ARD[[i]]$trees[[1]]$tip.label),
+           mean(changes$N),quantile(changes$N, c(cil,cih)), 
+           mean(changes$hy.both), quantile(changes$hy.both, c(cil,cih)),
+           mean(changes$both.hy), quantile(changes$both.hy, c(cil,cih)),
+           mean(changes$both.an), quantile(changes$both.an, c(cil,cih)),
+           mean(changes$an.both), quantile(changes$an.both, c(cil,cih)),
+           mean(changes$hy.an), quantile(changes$hy.an, c(cil,cih)),
+           mean(changes$an.hy), quantile(changes$an.hy, c(cil,cih)),
+           simmaps_Rec_nogain_ARD[[i]]$mod$ace[1,1],
+           simmaps_Rec_nogain_ARD[[i]]$mod$ace[1,2],
+           simmaps_Rec_nogain_ARD[[i]]$mod$ace[1,3])
+  names(res) <- names_simmap_3
+  simmap_Rec_results <- rbind(simmap_Rec_results, res)
+}
+simmap_Rec_results <- na.omit(simmap_Rec_results)
+simmap_Rec_results
+
+# Extract Q matrix
+Q_Rec_nogain_ARD <- as.data.frame(
+rbind(extract_Q(simmaps_Rec_nogain_ARD[[1]]$mod$tree),
+      extract_Q(simmaps_Rec_nogain_ARD[[2]]$mod$tree),
+      extract_Q(simmaps_Rec_nogain_ARD[[3]]$mod$tree)))
+Q_Rec_nogain_ARD$tree <- rep(names(trees), each=3)
+Q_Rec_nogain_ARD$MK_model <- "Rec_nogain_ARD"
+```
+
+```{r}
+Q_Rec_3states <- rbind(Q_Rec_nogain_ord, Q_Rec_nogain_ARD)
+```
+
+So finally the ordered ARD
+
+```{r}
+if (run_simmap == TRUE){
+  simmaps_Rec_ordered_ARD <- foreach(i = 1:ltre) %dopar% {
+      # we need libraries inside foreach
+      source("R/functions.R")
+      lapply(pkg, require, character.only = TRUE)
+      t <- trees[[i]]
+      name <- names(trees)[i]
+      print(name)
+      dfnew <- filter(df, !is.na(Rec)) %>% as.data.frame()
+      drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+      t <-  drop.tip(t, drop)
+      print(t)
+      Rec <- get_orderd_trait(t=t, df=dfnew, var="Rec", treename="Short")
+      Rec_simmap_mod <- plot_simmap_onemod(
+        paste0("fig/05_simmap_Rec_ordered_ARD_", name, ".pdf"),
+        Rec, tree = t, nsim=nsim, burnin=burnin,
+        samplefreq=samplefreq, model = ordered_ARD, cols = palette1,
+        piesize = 0.6, trans_tbl = df)
+      Rec_simmap_mod
+    }
+  # Save result to file:
+  saveRDS(simmaps_Rec_ordered_ARD , "output/05_simmaps_Rec_ordered_ARD.Rdata")
+}
+
+
+
+if (!exists("simmaps_Rec_ordered_ARD")){
+  simmaps_Rec_ordered_ARD  <- readRDS("output/05_simmaps_Rec_ordered_ARD.Rdata")
+}
+
+simmaps_Rec_ordered_ARD  <- setNames(simmaps_Rec_ordered_ARD , names(trees))
+
+traitName <- "Rec_ordered_ARD"
+for (i in 1:ltre) {
+  changes <- data.frame(simmaps_Rec_ordered_ARD[[i]]$mod$count)
+  res <- c(traitName, names(trees)[[i]], length(simmaps_Rec_ordered_ARD[[i]]$trees[[1]]$tip.label),
+           mean(changes$N),quantile(changes$N, c(cil,cih)), 
+           mean(changes$hy.both), quantile(changes$hy.both, c(cil,cih)),
+           mean(changes$both.hy), quantile(changes$both.hy, c(cil,cih)),
+           mean(changes$both.an), quantile(changes$both.an, c(cil,cih)),
+           mean(changes$an.both), quantile(changes$an.both, c(cil,cih)),
+           mean(changes$hy.an), quantile(changes$hy.an, c(cil,cih)),
+           mean(changes$an.hy), quantile(changes$an.hy, c(cil,cih)),
+           simmaps_Rec_ordered_ARD[[i]]$mod$ace[1,1],
+           simmaps_Rec_ordered_ARD[[i]]$mod$ace[1,2],
+           simmaps_Rec_ordered_ARD[[i]]$mod$ace[1,3])
+  names(res) <- names_simmap_3
+  simmap_Rec_results <- rbind(simmap_Rec_results, res)
+}
+simmap_Rec_results <- na.omit(simmap_Rec_results)
+
+Q_Rec_ordered_ARD <- as.data.frame(
+rbind(extract_Q(simmaps_Rec_ordered_ARD[[1]]$mod$tree),
+      extract_Q(simmaps_Rec_ordered_ARD[[2]]$mod$tree),
+      extract_Q(simmaps_Rec_ordered_ARD[[3]]$mod$tree)))
+Q_Rec_ordered_ARD$tree <- rep(names(trees), each=3)
+Q_Rec_ordered_ARD$MK_model <- "Rec_ordered_ARD"
+```
+
+```{r}
+Q_Rec_3states <- rbind(Q_Rec_3states, Q_Rec_ordered_ARD)
+```
+
+################################################################################
+Now for the same thing but with the binary trait.
+
+```{r}
+MKs_Rec_binary <- list()
+  
+for (i in 1:ltre) {
+  t <- trees[[i]]
+  name <- names(trees)[i]
+  dfnew <- filter(df, !is.na(Rec_binary)) %>% as.data.frame()
+  drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+  t <-  drop.tip(t, drop)
+  Rec_binary <- get_orderd_trait(t=t, df=dfnew, var="Rec_binary", treename="Short")
+  MK_mod <- plot_MK(paste0("fig/05_MK_Rec_binary_",name,".pdf"),
+                    Rec_binary, t,cols=palette1)
+  MKs_Rec_binary <- c(MKs_Rec_binary,  setNames(list(MK_mod), name))
+}
+```
+
+The prefered model estimates a low rate for gains. Let's also fit a model without gains and 
+see if it fits better
+```{r}
+
+MKs_Rec_binary_nogain <- list()
+no_gain <- matrix(c(0,1,0,0 ),2)
+
+
+for (i in 1:ltre) {
+  t <- trees[[i]]
+  name <- names(trees)[i]
+  dfnew <- filter(df, !is.na(Rec_binary)) %>% as.data.frame()
+  drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+  t <-  drop.tip(t, drop)
+  Rec_binary <- get_orderd_trait(t=t, df=dfnew, var="Rec_binary", treename="Short")
+  
+  MK_mod <- plot_MK_onemod(paste0("fig/05_MK_Rec_binary_nogain_",name,".pdf"), Rec_binary, t, no_gain, cols=palette1)
+  
+  MKs_Rec_binary_nogain <- c(MKs_Rec_binary_nogain,  setNames(list(MK_mod), name))
+}
+```
+
+```{r}
+model_names <- c("ER", "no gains", "ARD")
+model_comp_Rec2 <- model_comp_template
+for (i in 1:ltre) {
+AICc <- c(MKs_Rec_binary[[i]]$fitER$aicc,
+          MKs_Rec_binary_nogain[[i]]$mod$aicc,
+          MKs_Rec_binary[[i]]$fitARD$aicc)
+
+dfs <- c(
+  length(MKs_Rec_binary[[i]]$fitER$rates),
+  length(MKs_Rec_binary_nogain[[i]]$mod$rates),
+  length(MKs_Rec_binary[[i]]$fitARD$rates)
+  )
+
+Log.lik <- c(
+  MKs_Rec_binary[[i]]$fitER$loglik,
+  MKs_Rec_binary_nogain[[i]]$mod$loglik,
+  MKs_Rec_binary[[i]]$fitARD$loglik
+  )
+
+names(AICc) <- model_names
+deltaAICc <- AICc- min(AICc)
+AICcweights <- exp(-1/2 * deltaAICc)/sum(exp(-1/2 * deltaAICc))
+  
+comp <- as.data.frame(round(cbind(dfs,Log.lik,AICc,deltaAICc,AICcweights),3))
+comp$trait <- "received sperm (2 states)"
+comp$tree <- names(trees)[i]
+comp$model <- row.names(comp)
+comp <- comp[,c(6:8,1:5)]
+
+model_comp_Rec2 <- rbind(model_comp_Rec2, comp)
+}
+
+model_comp_Rec <- rbind(model_comp_Rec2, model_comp_Rec3)
+```
+
+The model with no gains has fewer parameters and is preferred over the ARD model but it also still has some support so I run this as well.
+Now that we have the correct model let's do stochastic character mapping for the actual reconstruction.
+
+```{r}
+if (run_simmap == TRUE){
+  simmaps_Rec2_nogain <- foreach(i = 1:ltre) %dopar% {
+      # we need libraries inside foreach
+      source("R/functions.R")
+      lapply(pkg, require, character.only = TRUE)
+      t <- trees[[i]]
+      name <- names(trees)[i]
+      dfnew <- filter(df, !is.na(Rec_binary)) %>% as.data.frame()
+      drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+      t <-  drop.tip(t, drop)
+      Rec_binary <- get_orderd_trait(t=t, df=dfnew, var="Rec_binary", treename="Short")
+      Rec_simmap_mod <- plot_simmap_onemod(
+        paste0("fig/05_simmap_Rec2_nogain_", name, ".pdf"),
+        Rec_binary, tree = t, nsim=nsim, burnin=burnin,
+        samplefreq=samplefreq, model = no_gain, cols = palette3,
+        piesize = 0.6, trans_tbl = df)
+      Rec_simmap_mod
+    }
+  # Save result to file:
+  saveRDS(simmaps_Rec2_nogain , "output/05_simmaps_Rec2_nogain.Rdata")
+}
+
+
+# Check if the file exists and load if not 
+if (!exists("simmaps_Rec2_nogain")){
+  simmaps_Rec2_nogain  <- readRDS("output/05_simmaps_Rec2_nogain.Rdata")
+}
+
+simmaps_Rec2_nogain  <- setNames(simmaps_Rec2_nogain , names(trees))
+
+par(mfrow=c(1,3))
+describe.simmap(simmaps_Rec2_nogain[[1]]$trees, plot=TRUE)
+describe.simmap(simmaps_Rec2_nogain[[2]]$trees, plot=TRUE)
+describe.simmap(simmaps_Rec2_nogain[[3]]$trees, plot=TRUE)
+
+## Calculate credible interval for each sample
+traitName <- "Rec2_nogain"
+simmap_Rec2_results <- simmap_all_results
+
+for (i in 1:ltre) {
+  changes <- data.frame(simmaps_Rec2_nogain[[i]]$mod$count)
+  res <- c(traitName, names(trees)[[i]], length(simmaps_Rec2_nogain[[i]]$trees[[1]]$tip.label),
+           mean(changes$N),quantile(changes$N, c(cil,cih)), 
+           mean(changes$X0.1), quantile(changes$X0.1, c(cil,cih)),
+           mean(changes$X1.0), quantile(changes$X1.0, c(cil,cih)),
+           simmaps_Rec2_nogain[[i]]$mod$ace[1,1],
+           simmaps_Rec2_nogain[[i]]$mod$ace[1,2])
+  names(res) <- names(simmap_all_results)
+  simmap_Rec2_results <- rbind(simmap_Rec2_results, res)
+}
+simmap_Rec2_results <- na.omit(simmap_Rec2_results)
+simmap_Rec2_results
+
+# Extract Q matrix
+Q_Rec2_nogain <- as.data.frame(
+rbind(extract_Q(simmaps_Rec2_nogain[[1]]$mod$tree),
+      extract_Q(simmaps_Rec2_nogain[[2]]$mod$tree),
+      extract_Q(simmaps_Rec2_nogain[[3]]$mod$tree)))
+Q_Rec2_nogain$tree <- rep(names(trees), each=2)
+Q_Rec2_nogain$MK_model <- "Rec2_nogain"
+```
+
+Now the ARD model as well.
+
+```{r}
+if (run_simmap == TRUE){
+  simmaps_Rec2_ARD <- foreach(i = 1:ltre) %dopar% {
+      # we need libraries inside foreach
+      source("R/functions.R")
+      lapply(pkg, require, character.only = TRUE)
+      t <- trees[[i]]
+      name <- names(trees)[i]
+      dfnew <- filter(df, !is.na(Rec_binary)) %>% as.data.frame()
+      drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+      t <-  drop.tip(t, drop)
+      Rec_binary <- get_orderd_trait(t=t, df=dfnew, var="Rec_binary", treename="Short")
+      Rec_simmap_mod <- plot_simmap_onemod(
+        paste0("fig/05_simmap_Rec2_ARD_", name, ".pdf"),
+        Rec_binary, tree = t, nsim=nsim, burnin=burnin,
+        samplefreq=samplefreq, model = "ARD", cols = palette3,
+        piesize = 0.6, trans_tbl = df)
+      Rec_simmap_mod
+    }
+  # Save result to file:
+  saveRDS(simmaps_Rec2_ARD , "output/05_simmaps_Rec2_ARD.Rdata")
+}
+
+
+# Check if the file exists and load if not 
+if (!exists("simmaps_Rec2_ARD")){
+  simmaps_Rec2_ARD  <- readRDS("output/05_simmaps_Rec2_ARD.Rdata")
+}
+
+simmaps_Rec2_ARD  <- setNames(simmaps_Rec2_ARD , names(trees))
+
+par(mfrow=c(1,3))
+describe.simmap(simmaps_Rec2_ARD[[1]]$trees, plot=TRUE)
+describe.simmap(simmaps_Rec2_ARD[[2]]$trees, plot=TRUE)
+describe.simmap(simmaps_Rec2_ARD[[3]]$trees, plot=TRUE)
+
+## Calculate credible interval for each sample
+traitName <- "Rec2_ARD"
+
+for (i in 1:ltre) {
+  changes <- data.frame(simmaps_Rec2_ARD[[i]]$mod$count)
+  res <- c(traitName, names(trees)[[i]], length(simmaps_Rec2_ARD[[i]]$trees[[1]]$tip.label),
+           mean(changes$N),quantile(changes$N, c(cil,cih)), 
+           mean(changes$X0.1), quantile(changes$X0.1, c(cil,cih)),
+           mean(changes$X1.0), quantile(changes$X1.0, c(cil,cih)),
+           simmaps_Rec2_ARD[[i]]$mod$ace[1,1],
+           simmaps_Rec2_ARD[[i]]$mod$ace[1,2])
+  names(res) <- names(simmap_all_results)
+  simmap_Rec2_results <- rbind(simmap_Rec2_results, res)
+}
+simmap_Rec2_results
+
+# Extract Q matrix
+Q_Rec2_ARD <- as.data.frame(
+rbind(extract_Q(simmaps_Rec2_ARD[[1]]$mod$tree),
+      extract_Q(simmaps_Rec2_ARD[[2]]$mod$tree),
+      extract_Q(simmaps_Rec2_ARD[[3]]$mod$tree)))
+Q_Rec2_ARD$tree <- rep(names(trees), each=2)
+Q_Rec2_ARD$MK_model <- "Rec2_ARD"
+```
+
+```{r}
+Q_Rec2 <- rbind(Q_Rec2_nogain, Q_Rec2_ARD)
+```
+
+################################################################################
+# Bristle
+
+Also here we will use both the 3 state model and the two state model.
+
+```{r}
+MKs_brstl3 <- list()
+textoffset=0.025
+i1 = 1.6
+i2 = 2.1
+piesize=4
+pal = palette1
+plots=list()
+for (i in 1:ltre) {
+  t <- trees[[i]]
+  name <- names(trees)[i]
+  dfnew <- filter(df, !is.na(bristle)) %>% as.data.frame()
+  drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+  t <-  drop.tip(t, drop)
+  bristle <- get_orderd_trait(t=t, df=dfnew, var="bristle", treename="Short")
+  
+  MK_mod <- plot_MK(paste0("fig/05_MK_bristle_",name,".pdf"), bristle, t, cols=palette2)
+  MKs_brstl3 <- c(MKs_brstl3,  setNames(list(MK_mod), name))
+}
+```
+
+### we also test if an ordered model fits well
+
+```{r}
+MKs_bristle3_ord <- list()
+ordered_ARD <- matrix(c(0,2,0,
+                        1,0,4,
+                        0,3,0 ),3)
+MKs_bristle3_nogain <- list()
+nogain_ARD <- t(matrix(c(0,0,0,
+                         1,0,2,
+                         3,4,0 ),3))
+
+MKs_bristle3_nogain_ord<- list()
+nogain_ord <- t(matrix(c(0,0,0,
+                       1,0,2,
+                       0,3,0 ),3))
+
+for (i in 1:ltre) {
+  t <- trees[[i]]
+  name <- names(trees)[i]
+  dfnew <- filter(df, !is.na(bristle)) %>% as.data.frame()
+  drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+  t <-  drop.tip(t, drop)
+  bristle <- get_orderd_trait(t=t, df=dfnew, var="bristle", treename="Short")
+  
+  MK_mod <- plot_MK_onemod(paste0("fig/05_MK_bristle3_nogain_ord_",name,".pdf"), bristle, t, nogain_ord, cols=palette2)
+  MKs_bristle3_nogain_ord <- c(MKs_bristle3_nogain_ord,  setNames(list(MK_mod), name))
+  
+  MK_mod <- plot_MK_onemod(paste0("fig/05_MK_bristle3_ord_",name,".pdf"), bristle, t,
+                           ordered_ARD, cols=palette2)
+  MKs_bristle3_ord <- c(MKs_bristle3_ord,  setNames(list(MK_mod), name))
+  
+  MK_mod <- plot_MK_onemod(paste0("fig/05_MK_bristle3_nogain_",name,".pdf"), bristle, t,
+                           nogain_ARD, cols=palette2)
+  MKs_bristle3_nogain <- c(MKs_bristle3_nogain,  setNames(list(MK_mod), name))
+}
+```
+
+### MODEL Results
+
+```{r}
+for (i in 1:ltre) {
+  print(names(MKs_brstl3)[i])
+  print(MKs_brstl3[[i]]$fitER)
+  print(MKs_brstl3[[i]]$fitSYM)
+  print(MKs_bristle3_nogain_ord[[i]]$mod)
+  print(MKs_bristle3_nogain[[i]]$mod)
+  print(MKs_bristle3_ord[[i]]$mod)
+  print(MKs_brstl3[[i]]$fitARD)
+}
+```
+
+There are no transition from hypodermic to both so the model can't estimate this rate!
+The ancestral state in these models is estimated to be "both".
+Let's see which one is prefered:
+
+```{r}
+model_names <- c("ER", "SYM", "ordered no gains", 
+                 "no gains", "ordered ARD", "ARD")
+model_comp_bristle3 <- model_comp_template
+for (i in 1:ltre) {
+AICc <- c(MKs_brstl3[[i]]$fitER$aicc,
+        MKs_brstl3[[i]]$fitSYM$aicc,
+        MKs_bristle3_nogain_ord[[i]]$mod$aicc,
+        MKs_bristle3_nogain[[i]]$mod$aicc,
+        MKs_bristle3_ord[[i]]$mod$aicc,
+        MKs_brstl3[[i]]$fitARD$aicc)
+
+dfs <- c(
+  length(MKs_brstl3[[i]]$fitER$rates),
+  length(MKs_brstl3[[i]]$fitSYM$rates),
+  length(MKs_bristle3_nogain_ord[[i]]$mod$rates),
+  length(MKs_bristle3_nogain[[i]]$mod$rates),
+  length(MKs_bristle3_ord[[i]]$mod$rates),
+  length(MKs_brstl3[[i]]$fitARD$rates)
+  )
+
+Log.lik <- c(
+  MKs_brstl3[[i]]$fitER$loglik,
+  MKs_brstl3[[i]]$fitSYM$loglik,
+  MKs_bristle3_nogain_ord[[i]]$mod$loglik,
+  MKs_bristle3_nogain[[i]]$mod$loglik,
+  MKs_bristle3_ord[[i]]$mod$loglik,
+  MKs_brstl3[[i]]$fitARD$loglik
+  )
+
+names(AICc) <- model_names
+deltaAICc <- AICc- min(AICc)
+AICcweights <- exp(-1/2 * deltaAICc)/sum(exp(-1/2 * deltaAICc))
+  
+comp <- as.data.frame(round(cbind(dfs,Log.lik,AICc,deltaAICc,AICcweights),3))
+comp$trait <- "sperm bristle (3 states)"
+comp$tree <- names(trees)[i]
+comp$model <- row.names(comp)
+comp <- comp[,c(6:8,1:5)]
+
+model_comp_bristle3 <- rbind(model_comp_bristle3, comp)
+}
+
+#TODO combine with Rec modelcomp
+model_comp_bristle3
+```
+
+For bristle again the ordered model without gains is preferred. I will again calculate the three best supported models. Based on delta AICc however I think we ar justified to just use the best model.
+
+```{r}
+if (run_simmap == TRUE){
+  simmaps_bristle3_nogain_ord <- foreach(i = 1:ltre) %dopar% {
+      # we need libraries inside foreach
+      source("R/functions.R")
+      lapply(pkg, require, character.only = TRUE)
+      t <- trees[[i]]
+      name <- names(trees)[i]
+      dfnew <- filter(df, !is.na(bristle)) %>% as.data.frame()
+      drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+      t <-  drop.tip(t, drop)
+      bristle <- get_orderd_trait(t=t, df=dfnew, var="bristle", treename="Short")
+      simmap_mod <- plot_simmap_onemod(
+        paste0("fig/05_simmap_bristle3_nogain_ord_", name, ".pdf"),
+        bristle, tree = t, nsim=nsim, burnin=burnin,
+        samplefreq=samplefreq, model = nogain_ord, cols = palette2,
+        piesize = 0.6, trans_tbl = df)
+      simmap_mod
+    }
+  # Save result to file:
+  saveRDS(simmaps_bristle3_nogain_ord , "output/05_simmaps_bristle3_nogain_ord.Rdata")
+  simmaps_bristle3_nogain_ord <- setNames(simmaps_bristle3_nogain_ord, names(trees))
+}
+
+
+# Check if the file exists and load if not 
+if (!exists("simmaps_bristle3_nogain_ord")){
+  simmaps_bristle3_nogain_ord <- readRDS("output/05_simmaps_bristle3_nogain_ord.Rdata")
+}
+
+# Calculate credible interval for each sample
+simmap_bristle3_results <- simmap_3_results
+
+traitName <- "bristle3_nogain_ordered"
+for (i in 1:ltre) {
+  changes <- data.frame(simmaps_bristle3_nogain_ord[[i]]$mod$count)
+  res <- c(traitName, names(trees)[[i]],
+           length(simmaps_bristle3_nogain_ord[[i]]$trees[[1]]$tip.label),
+           mean(changes$N),quantile(changes$N, c(cil,cih)), 
+           mean(changes$X0.1), quantile(changes$X0.1, c(cil,cih)),
+           mean(changes$X1.0), quantile(changes$X1.0, c(cil,cih)),
+           mean(changes$X1.2), quantile(changes$X1.2, c(cil,cih)),
+           mean(changes$X2.1), quantile(changes$X2.1, c(cil,cih)),
+           mean(changes$X0.2), quantile(changes$X0.2, c(cil,cih)),
+           mean(changes$X2.0), quantile(changes$X2.0, c(cil,cih)),
+           simmaps_bristle3_nogain_ord[[i]]$mod$ace[1,1],
+           simmaps_bristle3_nogain_ord[[i]]$mod$ace[1,2],
+           simmaps_bristle3_nogain_ord[[i]]$mod$ace[1,3])
+  names(res) <- names_simmap_3
+  simmap_bristle3_results <- rbind(simmap_bristle3_results, res)
+}
+
+# extract the Q matrix as well
+
+Q_bristle3_nogain_ord <- as.data.frame(rbind(
+      extract_Q(simmaps_bristle3_nogain_ord[[1]]$mod$tree),
+      extract_Q(simmaps_bristle3_nogain_ord[[2]]$mod$tree),
+      extract_Q(simmaps_bristle3_nogain_ord[[3]]$mod$tree)))
+Q_bristle3_nogain_ord$tree <- rep(names(trees), each=3)
+Q_bristle3_nogain_ord$MK_model <- "bristle3_nogain_ord"
+```
+
+There are two additional models with some support: no gains and ordered ARD.
+I do simmap for those as well.
+
+```{r}
+if (run_simmap == TRUE){
+  simmaps_bristle3_nogain <- foreach(i = 1:ltre) %dopar% {
+      # we need libraries inside foreach
+      source("R/functions.R")
+      lapply(pkg, require, character.only = TRUE)
+      t <- trees[[i]]
+      name <- names(trees)[i]
+      dfnew <- filter(df, !is.na(bristle)) %>% as.data.frame()
+      drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+      t <-  drop.tip(t, drop)
+      bristle <- get_orderd_trait(t=t, df=dfnew, var="bristle", treename="Short")
+      simmap_mod <- plot_simmap_onemod(
+        paste0("fig/05_simmap_bristle3_nogain_", name, ".pdf"),
+        bristle, tree = t, nsim=nsim, burnin=burnin,
+        samplefreq=samplefreq, model = nogain_ARD, cols = palette2,
+        piesize = 0.6, trans_tbl = df)
+      simmap_mod
+    }
+  # Save result to file:
+  saveRDS(simmaps_bristle3_nogain , "output/05_simmaps_bristle3_nogain.Rdata")
+  simmaps_bristle3_nogain <- setNames(simmaps_bristle3_nogain, names(trees))
+}
+
+# Check if the file exists and load if not 
+if (!exists("simmaps_bristle3_nogain")){
+  simmaps_bristle3_nogain <- readRDS("output/05_simmaps_bristle3_nogain.Rdata")
+}
+
+# Calculate credible interval for each sample
+traitName <- "bristle3_nogain"
+for (i in 1:ltre) {
+  changes <- data.frame(simmaps_bristle3_nogain[[i]]$mod$count)
+  res <- c(traitName, names(trees)[[i]],
+           length(simmaps_bristle3_nogain[[i]]$trees[[1]]$tip.label),
+           mean(changes$N),quantile(changes$N, c(cil,cih)), 
+           mean(changes$X0.1), quantile(changes$X0.1, c(cil,cih)),
+           mean(changes$X1.0), quantile(changes$X1.0, c(cil,cih)),
+           mean(changes$X1.2), quantile(changes$X1.2, c(cil,cih)),
+           mean(changes$X2.1), quantile(changes$X2.1, c(cil,cih)),
+           mean(changes$X0.2), quantile(changes$X0.2, c(cil,cih)),
+           mean(changes$X2.0), quantile(changes$X2.0, c(cil,cih)),
+           simmaps_bristle3_nogain[[i]]$mod$ace[1,1],
+           simmaps_bristle3_nogain[[i]]$mod$ace[1,2],
+           simmaps_bristle3_nogain[[i]]$mod$ace[1,3])
+  names(res) <- names_simmap_3
+  simmap_bristle3_results <- rbind(simmap_bristle3_results, res)
+}
+
+# extract the Q matrix as well
+Q_bristle3_nogain <- as.data.frame(rbind(
+      extract_Q(simmaps_bristle3_nogain[[1]]$mod$tree),
+      extract_Q(simmaps_bristle3_nogain[[2]]$mod$tree),
+      extract_Q(simmaps_bristle3_nogain[[3]]$mod$tree)))
+Q_bristle3_nogain$tree <- rep(names(trees), each=3)
+Q_bristle3_nogain$MK_model <- "bristle3_nogain"
+
+Q_bristle3 <- rbind(Q_bristle3_nogain_ord, Q_bristle3_nogain)
+```
+
+So finally the ordered ARD
+
+```{r}
+if (run_simmap == TRUE){
+  simmaps_bristle3_ord <- foreach(i = 1:ltre) %dopar% {
+      # we need libraries inside foreach
+      source("R/functions.R")
+      lapply(pkg, require, character.only = TRUE)
+      t <- trees[[i]]
+      name <- names(trees)[i]
+      dfnew <- filter(df, !is.na(bristle)) %>% as.data.frame()
+      drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+      t <-  drop.tip(t, drop)
+      bristle <- get_orderd_trait(t=t, df=dfnew, var="bristle", treename="Short")
+      simmap_mod <- plot_simmap_onemod(
+        paste0("fig/05_simmap_bristle3_ord_", name, ".pdf"),
+        bristle, tree = t, nsim=nsim, burnin=burnin,
+        samplefreq=samplefreq, model = ordered_ARD, cols = palette2,
+        piesize = 0.6, trans_tbl = df)
+      simmap_mod
+    }
+  # Save result to file:
+  saveRDS(simmaps_bristle3_ord , "output/05_simmaps_bristle3_ord.Rdata")
+  simmaps_bristle3_ord <- setNames(simmaps_bristle3_ord, names(trees))
+}
+
+# Check if the file exists and load if not 
+if (!exists("simmaps_bristle3_ord")){
+  simmaps_bristle3_ord <- readRDS("output/05_simmaps_bristle3_ord.Rdata")
+}
+
+# Calculate credible interval for each sample
+traitName <- "bristle3_ord"
+for (i in 1:ltre) {
+  changes <- data.frame(simmaps_bristle3_ord[[i]]$mod$count)
+  res <- c(traitName, names(trees)[[i]],
+           length(simmaps_bristle3_ord[[i]]$trees[[1]]$tip.label),
+           mean(changes$N),quantile(changes$N, c(cil,cih)), 
+           mean(changes$X0.1), quantile(changes$X0.1, c(cil,cih)),
+           mean(changes$X1.0), quantile(changes$X1.0, c(cil,cih)),
+           mean(changes$X1.2), quantile(changes$X1.2, c(cil,cih)),
+           mean(changes$X2.1), quantile(changes$X2.1, c(cil,cih)),
+           mean(changes$X0.2), quantile(changes$X0.2, c(cil,cih)),
+           mean(changes$X2.0), quantile(changes$X2.0, c(cil,cih)),
+           simmaps_bristle3_ord[[i]]$mod$ace[1,1],
+           simmaps_bristle3_ord[[i]]$mod$ace[1,2],
+           simmaps_bristle3_ord[[i]]$mod$ace[1,3])
+  names(res) <- names_simmap_3
+  simmap_bristle3_results <- rbind(simmap_bristle3_results, res)
+}
+
+# extract the Q matrix as well
+Q_bristle3_ord <- as.data.frame(rbind(
+      extract_Q(simmaps_bristle3_ord[[1]]$mod$tree),
+      extract_Q(simmaps_bristle3_ord[[2]]$mod$tree),
+      extract_Q(simmaps_bristle3_ord[[3]]$mod$tree)))
+Q_bristle3_ord$tree <- rep(names(trees), each=3)
+Q_bristle3_ord$MK_model <- "bristle3_ord"
+
+Q_bristle3 <- rbind(Q_bristle3, Q_bristle3_ord)
+```
+
+
+################################################################################
+
+# Bristle with binary states
+
+Now for the same thing but with the binary trait.
+
+```{r}
+MKs_bristle2 <- list()
+  
+for (i in 1:ltre) {
+  t <- trees[[i]]
+  name <- names(trees)[i]
+  dfnew <- filter(df, !is.na(bristle_binary)) %>% as.data.frame()
+  drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+  t <-  drop.tip(t, drop)
+  bristle2 <- get_orderd_trait(t=t, df=dfnew, var="bristle_binary", treename="Short")
+  MK_mod <- plot_MK(paste0("fig/05_MK_bristle2_",name,".pdf"),
+                    bristle2, t,cols=palette1)
+  MKs_bristle2 <- c(MKs_bristle2,  setNames(list(MK_mod), name))
+  print(anova(MKs_bristle2[[i]]$fitER, MKs_bristle2[[i]]$fitARD))
+}
+```
+
+Here there ML rate of gain is actually not close to zero as in the case of received sperm location.
+Let's have the no gain model anyway to see if it still fits better.
+
+```{r}
+MKs_bristle2_nogain <- list()
+no_gain <- matrix(c(0,1,0,0 ),2)
+
+for (i in 1:ltre) {
+  t <- trees[[i]]
+  name <- names(trees)[i]
+  dfnew <- filter(df, !is.na(bristle_binary)) %>% as.data.frame()
+  drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+  t <-  drop.tip(t, drop)
+  bristle2 <- get_orderd_trait(t=t, df=dfnew, var="bristle_binary", treename="Short")
+  
+  MK_mod <- plot_MK_onemod(paste0("fig/05_MK_Rec_binary_nogain_",name,".pdf"), 
+                           bristle2, t, no_gain, cols=palette1)
+  
+  MKs_bristle2_nogain <- c(MKs_bristle2_nogain,  setNames(list(MK_mod), name))
+}
+```
+
+
+```{r}
+model_names <- c("ER", "no gains", "ARD")
+model_comp_bristle2 <- model_comp_template
+for (i in 1:ltre) {
+AICc <- c(MKs_bristle2[[i]]$fitER$aicc,
+          MKs_bristle2_nogain[[i]]$mod$aicc,
+          MKs_bristle2[[i]]$fitARD$aicc)
+
+dfs <- c(
+  length(MKs_bristle2[[i]]$fitER$rates),
+  length(MKs_bristle2_nogain[[i]]$mod$rates),
+  length(MKs_bristle2[[i]]$fitARD$rates)
+  )
+
+Log.lik <- c(
+  MKs_bristle2[[i]]$fitER$loglik,
+  MKs_bristle2_nogain[[i]]$mod$loglik,
+  MKs_bristle2[[i]]$fitARD$loglik
+  )
+
+names(AICc) <- model_names
+deltaAICc <- AICc- min(AICc)
+AICcweights <- exp(-1/2 * deltaAICc)/sum(exp(-1/2 * deltaAICc))
+  
+comp <- as.data.frame(round(cbind(dfs,Log.lik,AICc,deltaAICc,AICcweights),3))
+comp$trait <- "sperm bristle (2 states)"
+comp$tree <- names(trees)[i]
+comp$model <- row.names(comp)
+comp <- comp[,c(6:8,1:5)]
+
+model_comp_bristle2 <- rbind(model_comp_bristle2, comp)
+}
+
+model_comp_bristle2<- rbind(model_comp_bristle2, model_comp_bristle3)
+```
+
+The model with no gains has fewer parameters and is preferred over the ARD model. 
+The ARD model is however quite close in AICc so we run it as well.
+
+### Simmaps
+```{r}
+if (run_simmap == TRUE){
+  simmaps_bristle2_nogain <- foreach(i = 1:ltre) %dopar% {
+      # we need libraries inside foreach
+      source("R/functions.R")
+      lapply(pkg, require, character.only = TRUE)
+      t <- trees[[i]]
+      name <- names(trees)[i]
+      dfnew <- filter(df, !is.na(bristle_binary)) %>% as.data.frame()
+      drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+      t <-  drop.tip(t, drop)
+      bristle2 <- get_orderd_trait(t=t, df=dfnew, var="bristle_binary", treename="Short")
+      simmap_mod <- plot_simmap_onemod(
+        paste0("fig/05_simmap_bristle2_nogain_", name, ".pdf"),
+        bristle2, tree = t, nsim=nsim, burnin=burnin,
+        samplefreq=samplefreq, model = no_gain, cols = palette3,
+        piesize = 0.6, trans_tbl = df)
+      simmap_mod
+    }
+  # Save result to file:
+  saveRDS(simmaps_bristle2_nogain , "output/05_simmaps_bristle2_nogain.Rdata")
+}
+
+
+# Check if the file exists and load if not 
+if (!exists("simmaps_bristle2_nogain")){
+  simmaps_bristle2_nogain  <- readRDS("output/05_simmaps_bristle2_nogain.Rdata")
+}
+
+simmaps_bristle2_nogain  <- setNames(simmaps_bristle2_nogain , names(trees))
+
+par(mfrow=c(1,3))
+describe.simmap(simmaps_bristle2_nogain[[1]]$trees, plot=TRUE)
+describe.simmap(simmaps_bristle2_nogain[[2]]$trees, plot=TRUE)
+describe.simmap(simmaps_bristle2_nogain[[3]]$trees, plot=TRUE)
+
+## Calculate credible interval for each sample
+traitName <- "bristle2_nogain"
+simmap_bristle2_results <- simmap_all_results
+
+for (i in 1:ltre) {
+  changes <- data.frame(simmaps_bristle2_nogain[[i]]$mod$count)
+  res <- c(traitName, names(trees)[[i]], length(simmaps_bristle2_nogain[[i]]$trees[[1]]$tip.label),
+           mean(changes$N),quantile(changes$N, c(cil,cih)), 
+           mean(changes$X0.1), quantile(changes$X0.1, c(cil,cih)),
+           mean(changes$X1.0), quantile(changes$X1.0, c(cil,cih)),
+           simmaps_bristle2_nogain[[i]]$mod$ace[1,1],
+           simmaps_bristle2_nogain[[i]]$mod$ace[1,2])
+  names(res) <- names(simmap_all_results)
+  simmap_bristle2_results <- rbind(simmap_bristle2_results, res)
+}
+simmap_bristle2_results <- na.omit(simmap_bristle2_results)
+simmap_bristle2_results
+
+# Extract Q matrix
+Q_bristle2_nogain <- as.data.frame(
+rbind(extract_Q(simmaps_bristle2_nogain[[1]]$mod$tree),
+      extract_Q(simmaps_bristle2_nogain[[2]]$mod$tree),
+      extract_Q(simmaps_bristle2_nogain[[3]]$mod$tree)))
+Q_bristle2_nogain$tree <- rep(names(trees), each=2)
+Q_bristle2_nogain$MK_model <- "bristle2_nogain"
+```
+
+Now the ARD model as well.
+
+```{r}
+if (run_simmap == TRUE){
+  simmaps_bristle2_ARD <- foreach(i = 1:ltre) %dopar% {
+      # we need libraries inside foreach
+      source("R/functions.R")
+      lapply(pkg, require, character.only = TRUE)
+      t <- trees[[i]]
+      name <- names(trees)[i]
+      dfnew <- filter(df, !is.na(bristle_binary)) %>% as.data.frame()
+      drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+      t <-  drop.tip(t, drop)
+      bristle2 <- get_orderd_trait(t=t, df=dfnew, var="bristle_binary", treename="Short")
+      simmap_mod <- plot_simmap_onemod(
+        paste0("fig/05_simmap_bristle2_ARD_", name, ".pdf"),
+        bristle2, tree = t, nsim=nsim, burnin=burnin,
+        samplefreq=samplefreq, model = "ARD", cols = palette3,
+        piesize = 0.6, trans_tbl = df)
+      simmap_mod
+    }
+  # Save result to file:
+  saveRDS(simmaps_bristle2_ARD , "output/05_simmaps_bristle2_ARD.Rdata")
+}
+
+
+# Check if the file exists and load if not 
+if (!exists("simmaps_bristle2_ARD")){
+  simmaps_bristle2_ARD  <- readRDS("output/05_simmaps_bristle2_ARD.Rdata")
+}
+
+simmaps_bristle2_ARD  <- setNames(simmaps_bristle2_ARD , names(trees))
+
+par(mfrow=c(1,3))
+describe.simmap(simmaps_bristle2_ARD[[1]]$trees, plot=TRUE)
+describe.simmap(simmaps_bristle2_ARD[[2]]$trees, plot=TRUE)
+describe.simmap(simmaps_bristle2_ARD[[3]]$trees, plot=TRUE)
+
+## Calculate credible interval for each sample
+traitName <- "bristle2_ARD"
+
+for (i in 1:ltre) {
+  changes <- data.frame(simmaps_bristle2_ARD[[i]]$mod$count)
+  res <- c(traitName, names(trees)[[i]], length(simmaps_bristle2_ARD[[i]]$trees[[1]]$tip.label),
+           mean(changes$N),quantile(changes$N, c(cil,cih)), 
+           mean(changes$X0.1), quantile(changes$X0.1, c(cil,cih)),
+           mean(changes$X1.0), quantile(changes$X1.0, c(cil,cih)),
+           simmaps_bristle2_ARD[[i]]$mod$ace[1,1],
+           simmaps_bristle2_ARD[[i]]$mod$ace[1,2])
+  names(res) <- names(simmap_all_results)
+  simmap_bristle2_results <- rbind(simmap_bristle2_results, res)
+}
+simmap_bristle2_results
+
+# Extract Q matrix
+Q_bristle2_ARD <- as.data.frame(
+rbind(extract_Q(simmaps_bristle2_ARD[[1]]$mod$tree),
+      extract_Q(simmaps_bristle2_ARD[[2]]$mod$tree),
+      extract_Q(simmaps_bristle2_ARD[[3]]$mod$tree)))
+Q_bristle2_ARD$tree <- rep(names(trees), each=2)
+Q_bristle2_ARD$MK_model <- "bristle2_ARD"
+
+Q_bristle2 <- rbind(Q_bristle2_nogain, Q_bristle2_ARD)
+```
+
+################################################################################
+
+# Antrum thickness
+
+We only consider this as a binary trait.
+
+```{r}
+MKs_an2 <- list()
+  
+for (i in 1:ltre) {
+  t <- trees[[i]]
+  name <- names(trees)[i]
+  dfnew <- filter(df, !is.na(an_binary)) %>% as.data.frame()
+  drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+  t <-  drop.tip(t, drop)
+  an2 <- get_orderd_trait(t=t, df=dfnew, var="an_binary", treename="Short")
+  MK_mod <- plot_MK(paste0("fig/05_MK_an2_",name,".pdf"),
+                    an2, t,cols=palette1)
+  MKs_an2 <- c(MKs_an2,  setNames(list(MK_mod), name))
+  print(anova(MKs_an2[[i]]$fitER, MKs_an2[[i]]$fitARD))
+}
+```
+
+Again a pure loss model might fit better.
+
+```{r}
+MKs_an2_nogain <- list()
+no_gain <- matrix(c(0,1,0,0 ),2)
+
+for (i in 1:ltre) {
+  t <- trees[[i]]
+  name <- names(trees)[i]
+  dfnew <- filter(df, !is.na(an_binary)) %>% as.data.frame()
+  drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+  t <-  drop.tip(t, drop)
+  an2 <- get_orderd_trait(t=t, df=dfnew, var="an_binary", treename="Short")
+  
+  MK_mod <- plot_MK_onemod(paste0("fig/05_MK_Rec_binary_nogain_",name,".pdf"), 
+                           an2, t, no_gain, cols=palette1)
+  
+  MKs_an2_nogain <- c(MKs_an2_nogain,  setNames(list(MK_mod), name))
+}
+```
+
+```{r}
+model_names <- c("ER", "no gains", "ARD")
+model_comp_an2 <- model_comp_template
+for (i in 1:ltre) {
+AICc <- c(MKs_an2[[i]]$fitER$aicc,
+          MKs_an2_nogain[[i]]$mod$aicc,
+          MKs_an2[[i]]$fitARD$aicc)
+
+dfs <- c(
+  length(MKs_an2[[i]]$fitER$rates),
+  length(MKs_an2_nogain[[i]]$mod$rates),
+  length(MKs_an2[[i]]$fitARD$rates)
+  )
+
+Log.lik <- c(
+  MKs_an2[[i]]$fitER$loglik,
+  MKs_an2_nogain[[i]]$mod$loglik,
+  MKs_an2[[i]]$fitARD$loglik
+  )
+
+names(AICc) <- model_names
+deltaAICc <- AICc- min(AICc)
+AICcweights <- exp(-1/2 * deltaAICc)/sum(exp(-1/2 * deltaAICc))
+  
+comp <- as.data.frame(round(cbind(dfs,Log.lik,AICc,deltaAICc,AICcweights),3))
+comp$trait <- "sperm an (2 states)"
+comp$tree <- names(trees)[i]
+comp$model <- row.names(comp)
+comp <- comp[,c(6:8,1:5)]
+
+model_comp_an2 <- rbind(model_comp_an2, comp)
+}
+model_comp_an2
+```
+
+The model with no gains has fewer parameters and is preferred over the ARD model. 
+The ARD model is however quite close in AICc so we run it as well.
+
+### Simmaps
+```{r}
+if (run_simmap == TRUE){
+  simmaps_an2_nogain <- foreach(i = 1:ltre) %dopar% {
+      # we need libraries inside foreach
+      source("R/functions.R")
+      lapply(pkg, require, character.only = TRUE)
+      t <- trees[[i]]
+      name <- names(trees)[i]
+      dfnew <- filter(df, !is.na(an_binary)) %>% as.data.frame()
+      drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+      t <-  drop.tip(t, drop)
+      an2 <- get_orderd_trait(t=t, df=dfnew, var="an_binary", treename="Short")
+      simmap_mod <- plot_simmap_onemod(
+        paste0("fig/05_simmap_an2_nogain_", name, ".pdf"),
+        an2, tree = t, nsim=nsim, burnin=burnin,
+        samplefreq=samplefreq, model = no_gain, cols = palette3,
+        piesize = 0.6, trans_tbl = df)
+      simmap_mod
+    }
+  # Save result to file:
+  saveRDS(simmaps_an2_nogain , "output/05_simmaps_an2_nogain.Rdata")
+}
+
+
+# Check if the file exists and load if not 
+if (!exists("simmaps_an2_nogain")){
+  simmaps_an2_nogain  <- readRDS("output/05_simmaps_an2_nogain.Rdata")
+}
+
+simmaps_an2_nogain  <- setNames(simmaps_an2_nogain , names(trees))
+
+par(mfrow=c(1,3))
+describe.simmap(simmaps_an2_nogain[[1]]$trees, plot=TRUE)
+describe.simmap(simmaps_an2_nogain[[2]]$trees, plot=TRUE)
+describe.simmap(simmaps_an2_nogain[[3]]$trees, plot=TRUE)
+
+## Calculate credible interval for each sample
+traitName <- "an2_nogain"
+simmap_an2_results <- simmap_all_results
+
+for (i in 1:ltre) {
+  changes <- data.frame(simmaps_an2_nogain[[i]]$mod$count)
+  res <- c(traitName, names(trees)[[i]], length(simmaps_an2_nogain[[i]]$trees[[1]]$tip.label),
+           mean(changes$N),quantile(changes$N, c(cil,cih)), 
+           mean(changes$X0.1), quantile(changes$X0.1, c(cil,cih)),
+           mean(changes$X1.0), quantile(changes$X1.0, c(cil,cih)),
+           simmaps_an2_nogain[[i]]$mod$ace[1,1],
+           simmaps_an2_nogain[[i]]$mod$ace[1,2])
+  names(res) <- names(simmap_all_results)
+  simmap_an2_results <- rbind(simmap_an2_results, res)
+}
+simmap_an2_results <- na.omit(simmap_an2_results)
+simmap_an2_results
+
+# Extract Q matrix
+Q_an2_nogain <- as.data.frame(
+rbind(extract_Q(simmaps_an2_nogain[[1]]$mod$tree),
+      extract_Q(simmaps_an2_nogain[[2]]$mod$tree),
+      extract_Q(simmaps_an2_nogain[[3]]$mod$tree)))
+Q_an2_nogain$tree <- rep(names(trees), each=2)
+Q_an2_nogain$MK_model <- "an2_nogain"
+```
+
+Now the ARD model as well.
+
+```{r}
+if (run_simmap == TRUE){
+  simmaps_an2_ARD <- foreach(i = 1:ltre) %dopar% {
+      # we need libraries inside foreach
+      source("R/functions.R")
+      lapply(pkg, require, character.only = TRUE)
+      t <- trees[[i]]
+      name <- names(trees)[i]
+      dfnew <- filter(df, !is.na(an_binary)) %>% as.data.frame()
+      drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+      t <-  drop.tip(t, drop)
+      an2 <- get_orderd_trait(t=t, df=dfnew, var="an_binary", treename="Short")
+      simmap_mod <- plot_simmap_onemod(
+        paste0("fig/05_simmap_an2_ARD_", name, ".pdf"),
+        an2, tree = t, nsim=nsim, burnin=burnin,
+        samplefreq=samplefreq, model = "ARD", cols = palette3,
+        piesize = 0.6, trans_tbl = df)
+      simmap_mod
+    }
+  # Save result to file:
+  saveRDS(simmaps_an2_ARD , "output/05_simmaps_an2_ARD.Rdata")
+}
+
+
+# Check if the file exists and load if not 
+if (!exists("simmaps_an2_ARD")){
+  simmaps_an2_ARD  <- readRDS("output/05_simmaps_an2_ARD.Rdata")
+}
+
+simmaps_an2_ARD  <- setNames(simmaps_an2_ARD , names(trees))
+
+par(mfrow=c(1,3))
+describe.simmap(simmaps_an2_ARD[[1]]$trees, plot=TRUE)
+describe.simmap(simmaps_an2_ARD[[2]]$trees, plot=TRUE)
+describe.simmap(simmaps_an2_ARD[[3]]$trees, plot=TRUE)
+
+## Calculate credible interval for each sample
+traitName <- "an2_ARD"
+
+for (i in 1:ltre) {
+  changes <- data.frame(simmaps_an2_ARD[[i]]$mod$count)
+  res <- c(traitName, names(trees)[[i]], length(simmaps_an2_ARD[[i]]$trees[[1]]$tip.label),
+           mean(changes$N),quantile(changes$N, c(cil,cih)), 
+           mean(changes$X0.1), quantile(changes$X0.1, c(cil,cih)),
+           mean(changes$X1.0), quantile(changes$X1.0, c(cil,cih)),
+           simmaps_an2_ARD[[i]]$mod$ace[1,1],
+           simmaps_an2_ARD[[i]]$mod$ace[1,2])
+  names(res) <- names(simmap_all_results)
+  simmap_an2_results <- rbind(simmap_an2_results, res)
+}
+simmap_an2_results
+
+# Extract Q matrix
+Q_an2_ARD <- as.data.frame(
+rbind(extract_Q(simmaps_an2_ARD[[1]]$mod$tree),
+      extract_Q(simmaps_an2_ARD[[2]]$mod$tree),
+      extract_Q(simmaps_an2_ARD[[3]]$mod$tree)))
+Q_an2_ARD$tree <- rep(names(trees), each=2)
+Q_an2_ARD$MK_model <- "an2_ARD"
+
+Q_an2 <- rbind(Q_an2_nogain, Q_an2_ARD)
+```
+
+################################################################################
+
+# Inferred Syndrome
+
+Also here we will use both the 3 state model and the two state model.
+
+We need to prepare the data:
+
+```{r}
+df$inferred_syndrome_binary <- ifelse(df$inferred_syndrome %in% c("hypodermic", "reciprocal"), as.character(df$inferred_syndrome), NA)
+```
+
+
+```{r}
+MKs_inferred_syndrome <- list()
+textoffset=0.025
+i1 = 1.6
+i2 = 2.1
+piesize=4
+pal = palette1
+plots=list()
+for (i in 1:ltre) {
+  t <- trees[[i]]
+  name <- names(trees)[i]
+  dfnew <- filter(df, ! inferred_syndrome == "unclear") %>% as.data.frame()
+  drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+  t <-  drop.tip(t, drop)
+  trait <- get_orderd_trait(t=t, df=dfnew, var="inferred_syndrome", treename="Short")
+  
+  MK_mod <- plot_MK(paste0("fig/05_MK_inferred_syndrome_",name,".pdf"), trait, t, cols=palette2)
+  MKs_inferred_syndrome <- c(MKs_inferred_syndrome,  setNames(list(MK_mod), name))
+}
+```
+
+
+```{r}
+anova(
+  MKs_inferred_syndrome$`C-IQ-TREE`$fitER,
+  MKs_inferred_syndrome$`C-IQ-TREE`$fitSYM,
+  MKs_inferred_syndrome$`C-IQ-TREE`$fitARD)
+```
+
+Here again the ARD model fits best and it fits zeroes for gains and a low number for direct shifts to reciprocal. So again we do the three simple models.
+
+```{r}
+MKs_inferred_syndrome_ord <- list()
+ordered_ARD <- matrix(c(0,2,0,
+                        1,0,4,
+                        0,3,0 ),3)
+MKs_inferred_syndrome_nogain <- list()
+nogain_ARD <- t(matrix(c(0,0,0,
+                         1,0,2,
+                         3,4,0 ),3))
+
+MKs_inferred_syndrome_nogain_ord<- list()
+nogain_ord <- t(matrix(c(0,0,0,
+                       1,0,2,
+                       0,3,0 ),3))
+
+for (i in 1:ltre) {
+  t <- trees[[i]]
+  name <- names(trees)[i]
+  dfnew <- filter(df, ! inferred_syndrome == "unclear") %>% as.data.frame()
+  drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+  t <-  drop.tip(t, drop)
+  trait <- get_orderd_trait(t=t, df=dfnew, var="inferred_syndrome", treename="Short")
+  
+  MK_mod <- plot_MK_onemod(paste0("fig/05_MK_inferred_syndrome_nogain_ord_",name,".pdf"), trait, t, nogain_ord, cols=palette2)
+  MKs_inferred_syndrome_nogain_ord <- c(MKs_inferred_syndrome_nogain_ord,  setNames(list(MK_mod), name))
+  
+  MK_mod <- plot_MK_onemod(paste0("fig/05_MK_inferred_syndrome_ord_",name,".pdf"), trait, t,
+                           ordered_ARD, cols=palette2)
+  MKs_inferred_syndrome_ord <- c(MKs_inferred_syndrome_ord,  setNames(list(MK_mod), name))
+  
+  MK_mod <- plot_MK_onemod(paste0("fig/05_MK_inferred_syndrome_nogain_",name,".pdf"), trait, t,
+                           nogain_ARD, cols=palette2)
+  MKs_inferred_syndrome_nogain <- c(MKs_inferred_syndrome_nogain,  setNames(list(MK_mod), name))
+}
+```
+
+### MODEL Results
+
+```{r}
+for (i in 1:ltre) {
+  print(names(MKs_inferred_syndrome)[i])
+  print(MKs_inferred_syndrome[[i]]$fitER)
+  print(MKs_inferred_syndrome[[i]]$fitSYM)
+  print(MKs_inferred_syndrome_nogain_ord[[i]]$mod)
+  print(MKs_inferred_syndrome_nogain[[i]]$mod)
+  print(MKs_inferred_syndrome_ord[[i]]$mod)
+  print(MKs_inferred_syndrome[[i]]$fitARD)
+}
+```
+
+There are no transition from hypodermic to both so the model can't estimate this rate!
+The ancestral state in these models is estimated to be "both".
+Let's see which one is prefered:
+
+```{r}
+model_names <- c("ER", "SYM", "ordered no gains", 
+                 "no gains", "ordered ARD", "ARD")
+model_comp_inferred_syndrome <- model_comp_template
+for (i in 1:ltre) {
+AICc <- c(MKs_inferred_syndrome[[i]]$fitER$aicc,
+        MKs_inferred_syndrome[[i]]$fitSYM$aicc,
+        MKs_inferred_syndrome_nogain_ord[[i]]$mod$aicc,
+        MKs_inferred_syndrome_nogain[[i]]$mod$aicc,
+        MKs_inferred_syndrome_ord[[i]]$mod$aicc,
+        MKs_inferred_syndrome[[i]]$fitARD$aicc)
+
+dfs <- c(
+  length(MKs_inferred_syndrome[[i]]$fitER$rates),
+  length(MKs_inferred_syndrome[[i]]$fitSYM$rates),
+  length(MKs_inferred_syndrome_nogain_ord[[i]]$mod$rates),
+  length(MKs_inferred_syndrome_nogain[[i]]$mod$rates),
+  length(MKs_inferred_syndrome_ord[[i]]$mod$rates),
+  length(MKs_inferred_syndrome[[i]]$fitARD$rates)
+  )
+
+Log.lik <- c(
+  MKs_inferred_syndrome[[i]]$fitER$loglik,
+  MKs_inferred_syndrome[[i]]$fitSYM$loglik,
+  MKs_inferred_syndrome_nogain_ord[[i]]$mod$loglik,
+  MKs_inferred_syndrome_nogain[[i]]$mod$loglik,
+  MKs_inferred_syndrome_ord[[i]]$mod$loglik,
+  MKs_inferred_syndrome[[i]]$fitARD$loglik
+  )
+
+names(AICc) <- model_names
+deltaAICc <- AICc- min(AICc)
+AICcweights <- exp(-1/2 * deltaAICc)/sum(exp(-1/2 * deltaAICc))
+  
+comp <- as.data.frame(round(cbind(dfs,Log.lik,AICc,deltaAICc,AICcweights),3))
+comp$trait <- "inferred syndrome (3 states)"
+comp$tree <- names(trees)[i]
+comp$model <- row.names(comp)
+comp <- comp[,c(6:8,1:5)]
+
+model_comp_inferred_syndrome <- rbind(model_comp_inferred_syndrome, comp)
+}
+
+#TODO combine with Rec modelcomp
+model_comp_inferred_syndrome
+```
+
+This gives a similar result to Rec. This is not surprising since there is a lot of overlap. Again I do the three best models.
+
+```{r}
+if (run_simmap == TRUE){
+  simmaps_inferred_syndrome_nogain_ord <- foreach(i = 1:ltre) %dopar% {
+      # we need libraries inside foreach
+      source("R/functions.R")
+      lapply(pkg, require, character.only = TRUE)
+      t <- trees[[i]]
+      name <- names(trees)[i]
+      dfnew <- filter(df, ! inferred_syndrome == "unclear") %>% as.data.frame()
+      drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+      t <-  drop.tip(t, drop)
+      trait <- get_orderd_trait(t=t, df=dfnew, var="inferred_syndrome", treename="Short")
+      simmap_mod <- plot_simmap_onemod(
+        paste0("fig/05_simmap_inferred_syndrome_nogain_ord_", name, ".pdf"),
+        trait, tree = t, nsim=nsim, burnin=burnin,
+        samplefreq=samplefreq, model = nogain_ord, cols = palette2,
+        piesize = 0.6, trans_tbl = df)
+      simmap_mod
+    }
+  # Save result to file:
+  saveRDS(simmaps_inferred_syndrome_nogain_ord , "output/05_simmaps_inferred_syndrome_nogain_ord.Rdata")
+  simmaps_inferred_syndrome_nogain_ord <- setNames(simmaps_inferred_syndrome_nogain_ord, names(trees))
+}
+
+
+# Check if the file exists and load if not 
+if (!exists("simmaps_inferred_syndrome_nogain_ord")){
+  simmaps_inferred_syndrome_nogain_ord <- readRDS("output/05_simmaps_inferred_syndrome_nogain_ord.Rdata")
+}
+
+# Calculate credible interval for each sample
+simmap_inferred_syndrome_results <- simmap_3_results
+
+traitName <- "inferred_syndrome_nogain_ordered"
+for (i in 1:ltre) {
+  changes <- data.frame(simmaps_inferred_syndrome_nogain_ord[[i]]$mod$count)
+  res <- c(traitName, names(trees)[[i]],
+           length(simmaps_inferred_syndrome_nogain_ord[[i]]$trees[[1]]$tip.label),
+           mean(changes$N),quantile(changes$N, c(cil,cih)), 
+           mean(changes$hypodermic.intermediate), quantile(changes$hypodermic.intermediate, c(cil,cih)),
+           mean(changes$intermediate.hypodermic), quantile(changes$intermediate.hypodermic, c(cil,cih)),
+           mean(changes$intermediate.reciprocal), quantile(changes$intermediate.reciprocal, c(cil,cih)),
+           mean(changes$reciprocal.intermediate), quantile(changes$reciprocal.intermediate, c(cil,cih)),
+           mean(changes$hypodermic.reciprocal), quantile(changes$hypodermic.reciprocal, c(cil,cih)),
+           mean(changes$reciprocal.hypodermic), quantile(changes$reciprocal.hypodermic, c(cil,cih)),
+           simmaps_inferred_syndrome_nogain_ord[[i]]$mod$ace[1,1],
+           simmaps_inferred_syndrome_nogain_ord[[i]]$mod$ace[1,2],
+           simmaps_inferred_syndrome_nogain_ord[[i]]$mod$ace[1,3])
+  names(res) <- names_simmap_3
+  simmap_inferred_syndrome_results <- rbind(simmap_inferred_syndrome_results, res)
+}
+
+# extract the Q matrix as well
+
+Q_inferred_syndrome_nogain_ord <- as.data.frame(rbind(
+      extract_Q(simmaps_inferred_syndrome_nogain_ord[[1]]$mod$tree),
+      extract_Q(simmaps_inferred_syndrome_nogain_ord[[2]]$mod$tree),
+      extract_Q(simmaps_inferred_syndrome_nogain_ord[[3]]$mod$tree)))
+Q_inferred_syndrome_nogain_ord$tree <- rep(names(trees), each=3)
+Q_inferred_syndrome_nogain_ord$MK_model <- "inferred_syndrome_nogain_ord"
+```
+
+There are two additional models with some support: no gains and ordered ARD.
+I do simmap for those as well.
+
+```{r}
+if (run_simmap == TRUE){
+  simmaps_inferred_syndrome_nogain <- foreach(i = 1:ltre) %dopar% {
+      # we need libraries inside foreach
+      source("R/functions.R")
+      lapply(pkg, require, character.only = TRUE)
+      t <- trees[[i]]
+      name <- names(trees)[i]
+      dfnew <- filter(df, ! inferred_syndrome == "unclear") %>% as.data.frame()
+      drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+      t <-  drop.tip(t, drop)
+      trait <- get_orderd_trait(t=t, df=dfnew, var="inferred_syndrome", treename="Short")
+      simmap_mod <- plot_simmap_onemod(
+        paste0("fig/05_simmap_inferred_syndrome_nogain_", name, ".pdf"),
+        trait, tree = t, nsim=nsim, burnin=burnin,
+        samplefreq=samplefreq, model = nogain_ARD, cols = palette2,
+        piesize = 0.6, trans_tbl = df)
+      simmap_mod
+    }
+  # Save result to file:
+  saveRDS(simmaps_inferred_syndrome_nogain , "output/05_simmaps_inferred_syndrome_nogain.Rdata")
+  simmaps_inferred_syndrome_nogain <- setNames(simmaps_inferred_syndrome_nogain, names(trees))
+}
+
+# Check if the file exists and load if not 
+if (!exists("simmaps_inferred_syndrome_nogain")){
+  simmaps_inferred_syndrome_nogain <- readRDS("output/05_simmaps_inferred_syndrome_nogain.Rdata")
+}
+
+# Calculate credible interval for each sample
+traitName <- "inferred_syndrome_nogain"
+for (i in 1:ltre) {
+  changes <- data.frame(simmaps_inferred_syndrome_nogain[[i]]$mod$count)
+  res <- c(traitName, names(trees)[[i]],
+           length(simmaps_inferred_syndrome_nogain[[i]]$trees[[1]]$tip.label),
+           mean(changes$N),quantile(changes$N, c(cil,cih)), 
+           mean(changes$hypodermic.intermediate), quantile(changes$hypodermic.intermediate, c(cil,cih)),
+           mean(changes$intermediate.hypodermic), quantile(changes$intermediate.hypodermic, c(cil,cih)),
+           mean(changes$intermediate.reciprocal), quantile(changes$intermediate.reciprocal, c(cil,cih)),
+           mean(changes$reciprocal.intermediate), quantile(changes$reciprocal.intermediate, c(cil,cih)),
+           mean(changes$hypodermic.reciprocal), quantile(changes$hypodermic.reciprocal, c(cil,cih)),
+           mean(changes$reciprocal.hypodermic), quantile(changes$reciprocal.hypodermic, c(cil,cih)),
+           simmaps_inferred_syndrome_nogain[[i]]$mod$ace[1,1],
+           simmaps_inferred_syndrome_nogain[[i]]$mod$ace[1,2],
+           simmaps_inferred_syndrome_nogain[[i]]$mod$ace[1,3])
+  names(res) <- names_simmap_3
+  simmap_inferred_syndrome_results <- rbind(simmap_inferred_syndrome_results, res)
+}
+
+# extract the Q matrix as well
+Q_inferred_syndrome_nogain <- as.data.frame(rbind(
+      extract_Q(simmaps_inferred_syndrome_nogain[[1]]$mod$tree),
+      extract_Q(simmaps_inferred_syndrome_nogain[[2]]$mod$tree),
+      extract_Q(simmaps_inferred_syndrome_nogain[[3]]$mod$tree)))
+Q_inferred_syndrome_nogain$tree <- rep(names(trees), each=3)
+Q_inferred_syndrome_nogain$MK_model <- "inferred_syndrome_nogain"
+
+Q_inferred_syndrome <- rbind(Q_inferred_syndrome_nogain_ord, Q_inferred_syndrome_nogain)
+```
+
+
+##########
+So finally the ordered ARD
+
+```{r}
+if (run_simmap == TRUE){
+  simmaps_inferred_syndrome_ord <- foreach(i = 1:ltre) %dopar% {
+      # we need libraries inside foreach
+      source("R/functions.R")
+      lapply(pkg, require, character.only = TRUE)
+      t <- trees[[i]]
+      name <- names(trees)[i]
+      dfnew <- filter(df, ! inferred_syndrome == "unclear") %>% as.data.frame()
+      drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+      t <-  drop.tip(t, drop)
+      trait <- get_orderd_trait(t=t, df=dfnew, var="inferred_syndrome", treename="Short")
+      simmap_mod <- plot_simmap_onemod(
+        paste0("fig/05_simmap_inferred_syndrome_ord_", name, ".pdf"),
+        trait, tree = t, nsim=nsim, burnin=burnin,
+        samplefreq=samplefreq, model = ordered_ARD, cols = palette2,
+        piesize = 0.6, trans_tbl = df)
+      simmap_mod
+    }
+  # Save result to file:
+  saveRDS(simmaps_inferred_syndrome_ord , "output/05_simmaps_inferred_syndrome_ord.Rdata")
+  simmaps_inferred_syndrome_ord <- setNames(simmaps_inferred_syndrome_ord, names(trees))
+}
+
+# Check if the file exists and load if not 
+if (!exists("simmaps_inferred_syndrome_ord")){
+  simmaps_inferred_syndrome_ord <- readRDS("output/05_simmaps_inferred_syndrome_ord.Rdata")
+}
+
+# Calculate credible interval for each sample
+traitName <- "inferred_syndrome_ord"
+for (i in 1:ltre) {
+  changes <- data.frame(simmaps_inferred_syndrome_ord[[i]]$mod$count)
+  res <- c(traitName, names(trees)[[i]],
+           length(simmaps_inferred_syndrome_ord[[i]]$trees[[1]]$tip.label),
+           mean(changes$N),quantile(changes$N, c(cil,cih)), 
+           mean(changes$hypodermic.intermediate), quantile(changes$hypodermic.intermediate, c(cil,cih)),
+           mean(changes$intermediate.hypodermic), quantile(changes$intermediate.hypodermic, c(cil,cih)),
+           mean(changes$intermediate.reciprocal), quantile(changes$intermediate.reciprocal, c(cil,cih)),
+           mean(changes$reciprocal.intermediate), quantile(changes$reciprocal.intermediate, c(cil,cih)),
+           mean(changes$hypodermic.reciprocal), quantile(changes$hypodermic.reciprocal, c(cil,cih)),
+           mean(changes$reciprocal.hypodermic), quantile(changes$reciprocal.hypodermic, c(cil,cih)),
+           simmaps_inferred_syndrome_ord[[i]]$mod$ace[1,1],
+           simmaps_inferred_syndrome_ord[[i]]$mod$ace[1,2],
+           simmaps_inferred_syndrome_ord[[i]]$mod$ace[1,3])
+  names(res) <- names_simmap_3
+  simmap_inferred_syndrome_results <- rbind(simmap_inferred_syndrome_results, res)
+}
+
+# extract the Q matrix as well
+Q_inferred_syndrome_ord <- as.data.frame(rbind(
+      extract_Q(simmaps_inferred_syndrome_ord[[1]]$mod$tree),
+      extract_Q(simmaps_inferred_syndrome_ord[[2]]$mod$tree),
+      extract_Q(simmaps_inferred_syndrome_ord[[3]]$mod$tree)))
+Q_inferred_syndrome_ord$tree <- rep(names(trees), each=3)
+Q_inferred_syndrome_ord$MK_model <- "inferred_syndrome_ord"
+
+Q_inferred_syndrome <- rbind(Q_inferred_syndrome, Q_inferred_syndrome_ord)
+```
+
+# Inferred syndrome binary
+
+We only consider this as a binary trait and group intermadiate as hypodermic.
+
+```{r}
+MKs_syn2 <- list()
+
+df <- df %>%
+  mutate(syn2 = case_when(
+    inferred_syndrome %in% c("hypodermic", "intermediate") ~ 0,
+    inferred_syndrome == "reciprocal" ~ 1,
+    TRUE ~ NA_real_))
+
+gg <- df %>%
+  mutate(syn2 = case_when(
+    inferred_syndrome %in% c("hypodermic", "intermediate") ~ 0,
+    inferred_syndrome == "reciprocal" ~ 1,
+    TRUE ~ NA_real_))
+  
+for (i in 1:ltre) {
+  t <- trees[[i]]
+  name <- names(trees)[i]
+  dfnew <- filter(df, !is.na(syn2)) %>% as.data.frame()
+  drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+  t <-  drop.tip(t, drop)
+  syn2 <- get_orderd_trait(t=t, df=dfnew, var="syn2", treename="Short")
+  MK_mod <- plot_MK(paste0("fig/05_MK_syn2_",name,".pdf"),
+                    syn2, t,cols=palette1)
+  MKs_syn2 <- c(MKs_syn2,  setNames(list(MK_mod), name))
+  print(anova(MKs_syn2[[i]]$fitER, MKs_syn2[[i]]$fitARD))
+}
+```
+
+Again a pure loss model might fit better.
+
+```{r}
+MKs_syn2_nogain <- list()
+no_gain <- matrix(c(0,1,0,0 ),2)
+
+for (i in 1:ltre) {
+  t <- trees[[i]]
+  name <- names(trees)[i]
+  dfnew <- filter(df, !is.na(syn2)) %>% as.data.frame()
+  drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+  t <-  drop.tip(t, drop)
+  syn2 <- get_orderd_trait(t=t, df=dfnew, var="syn2", treename="Short")
+  
+  MK_mod <- plot_MK_onemod(paste0("fig/05_MK_Syn_binary_nogain_",name,".pdf"), 
+                           syn2, t, no_gain, cols=palette1)
+  
+  MKs_syn2_nogain <- c(MKs_syn2_nogain,  setNames(list(MK_mod), name))
+}
+```
+
+```{r}
+model_names <- c("ER", "no gains", "ARD")
+model_comp_syn2 <- model_comp_template
+for (i in 1:ltre) {
+AICc <- c(MKs_syn2[[i]]$fitER$aicc,
+          MKs_syn2_nogain[[i]]$mod$aicc,
+          MKs_syn2[[i]]$fitARD$aicc)
+
+dfs <- c(
+  length(MKs_syn2[[i]]$fitER$rates),
+  length(MKs_syn2_nogain[[i]]$mod$rates),
+  length(MKs_syn2[[i]]$fitARD$rates)
+  )
+
+Log.lik <- c(
+  MKs_syn2[[i]]$fitER$loglik,
+  MKs_syn2_nogain[[i]]$mod$loglik,
+  MKs_syn2[[i]]$fitARD$loglik
+  )
+
+names(AICc) <- model_names
+deltaAICc <- AICc- min(AICc)
+AICcweights <- exp(-1/2 * deltaAICc)/sum(exp(-1/2 * deltaAICc))
+  
+comp <- as.data.frame(round(cbind(dfs,Log.lik,AICc,deltaAICc,AICcweights),3))
+comp$trait <- "Inferred Syndrome (2 states)"
+comp$tree <- names(trees)[i]
+comp$model <- row.names(comp)
+comp <- comp[,c(6:8,1:5)]
+
+model_comp_syn2 <- rbind(model_comp_syn2, comp)
+}
+model_comp_syn2
+```
+
+in H-IQ-TREE and H-ExaBayes the nogains and ARD find support and in C-IQ-TREE even all get good support.
+
+### Simmaps
+```{r}
+if (run_simmap == TRUE){
+  simmaps_syn2_nogain <- foreach(i = 1:ltre) %dopar% {
+      # we need libraries inside foreach
+      source("R/functions.R")
+      lapply(pkg, require, character.only = TRUE)
+      t <- trees[[i]]
+      name <- names(trees)[i]
+      dfnew <- filter(df, !is.na(syn2)) %>% as.data.frame()
+      drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+      t <-  drop.tip(t, drop)
+      syn2 <- get_orderd_trait(t=t, df=dfnew, var="syn2", treename="Short")
+      simmap_mod <- plot_simmap_onemod(
+        paste0("fig/05_simmap_syn2_nogain_", name, ".pdf"),
+        syn2, tree = t, nsim=nsim, burnin=burnin,
+        samplefreq=samplefreq, model = no_gain, cols = palette3,
+        piesize = 0.6, trans_tbl = df)
+      simmap_mod
+    }
+  # Save result to file:
+  saveRDS(simmaps_syn2_nogain , "output/05_simmaps_syn2_nogain.Rdata")
+}
+
+
+# Check if the file exists and load if not 
+if (!exists("simmaps_syn2_nogain")){
+  simmaps_syn2_nogain  <- readRDS("output/05_simmaps_syn2_nogain.Rdata")
+}
+
+simmaps_syn2_nogain  <- setNames(simmaps_syn2_nogain , names(trees))
+
+par(mfrow=c(1,3))
+describe.simmap(simmaps_syn2_nogain[[1]]$trees, plot=TRUE)
+describe.simmap(simmaps_syn2_nogain[[2]]$trees, plot=TRUE)
+describe.simmap(simmaps_syn2_nogain[[3]]$trees, plot=TRUE)
+
+## Calculate credible interval for each sample
+traitName <- "syn2_nogain"
+simmap_syn2_results <- simmap_all_results
+
+for (i in 1:ltre) {
+  changes <- data.frame(simmaps_syn2_nogain[[i]]$mod$count)
+  res <- c(traitName, names(trees)[[i]], length(simmaps_syn2_nogain[[i]]$trees[[1]]$tip.label),
+           mean(changes$N),quantile(changes$N, c(cil,cih)), 
+           mean(changes$X0.1), quantile(changes$X0.1, c(cil,cih)),
+           mean(changes$X1.0), quantile(changes$X1.0, c(cil,cih)),
+           simmaps_syn2_nogain[[i]]$mod$ace[1,1],
+           simmaps_syn2_nogain[[i]]$mod$ace[1,2])
+  names(res) <- names(simmap_all_results)
+  simmap_syn2_results <- rbind(simmap_syn2_results, res)
+}
+simmap_syn2_results <- na.omit(simmap_syn2_results)
+simmap_syn2_results
+
+# Extract Q matrix
+Q_syn2_nogain <- as.data.frame(
+rbind(extract_Q(simmaps_syn2_nogain[[1]]$mod$tree),
+      extract_Q(simmaps_syn2_nogain[[2]]$mod$tree),
+      extract_Q(simmaps_syn2_nogain[[3]]$mod$tree)))
+Q_syn2_nogain$tree <- rep(names(trees), each=2)
+Q_syn2_nogain$MK_model <- "syn2_nogain"
+```
+
+Now the ARD model as well.
+
+```{r}
+if (run_simmap == TRUE){
+  simmaps_syn2_ARD <- foreach(i = 1:ltre) %dopar% {
+      # we need libraries inside foreach
+      source("R/functions.R")
+      lapply(pkg, require, character.only = TRUE)
+      t <- trees[[i]]
+      name <- names(trees)[i]
+      dfnew <- filter(df, !is.na(syn2)) %>% as.data.frame()
+      drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+      t <-  drop.tip(t, drop)
+      syn2 <- get_orderd_trait(t=t, df=dfnew, var="syn2", treename="Short")
+      simmap_mod <- plot_simmap_onemod(
+        paste0("fig/05_simmap_syn2_ARD_", name, ".pdf"),
+        syn2, tree = t, nsim=nsim, burnin=burnin,
+        samplefreq=samplefreq, model = "ARD", cols = palette3,
+        piesize = 0.6, trans_tbl = df)
+      simmap_mod
+    }
+  # Save result to file:
+  saveRDS(simmaps_syn2_ARD , "output/05_simmaps_syn2_ARD.Rdata")
+}
+
+
+# Check if the file exists and load if not 
+if (!exists("simmaps_syn2_ARD")){
+  simmaps_syn2_ARD  <- readRDS("output/05_simmaps_syn2_ARD.Rdata")
+}
+
+simmaps_syn2_ARD  <- setNames(simmaps_syn2_ARD , names(trees))
+
+par(mfrow=c(1,3))
+describe.simmap(simmaps_syn2_ARD[[1]]$trees, plot=TRUE)
+describe.simmap(simmaps_syn2_ARD[[2]]$trees, plot=TRUE)
+describe.simmap(simmaps_syn2_ARD[[3]]$trees, plot=TRUE)
+
+## Calculate credible interval for each sample
+traitName <- "syn2_ARD"
+
+for (i in 1:ltre) {
+  changes <- data.frame(simmaps_syn2_ARD[[i]]$mod$count)
+  res <- c(traitName, names(trees)[[i]], length(simmaps_syn2_ARD[[i]]$trees[[1]]$tip.label),
+           mean(changes$N),quantile(changes$N, c(cil,cih)), 
+           mean(changes$X0.1), quantile(changes$X0.1, c(cil,cih)),
+           mean(changes$X1.0), quantile(changes$X1.0, c(cil,cih)),
+           simmaps_syn2_ARD[[i]]$mod$ace[1,1],
+           simmaps_syn2_ARD[[i]]$mod$ace[1,2])
+  names(res) <- names(simmap_all_results)
+  simmap_syn2_results <- rbind(simmap_syn2_results, res)
+}
+simmap_syn2_results
+
+# Extract Q matrix
+Q_syn2_ARD <- as.data.frame(
+rbind(extract_Q(simmaps_syn2_ARD[[1]]$mod$tree),
+      extract_Q(simmaps_syn2_ARD[[2]]$mod$tree),
+      extract_Q(simmaps_syn2_ARD[[3]]$mod$tree)))
+Q_syn2_ARD$tree <- rep(names(trees), each=2)
+Q_syn2_ARD$MK_model <- "syn2_ARD"
+
+Q_syn2 <- rbind(Q_syn2_nogain, Q_syn2_ARD)
+```
+
+Now the ER model as well.
+
+```{r}
+if (run_simmap == TRUE){
+  simmaps_syn2_ER <- foreach(i = 1:ltre) %dopar% {
+      # we need libraries inside foreach
+      source("R/functions.R")
+      lapply(pkg, require, character.only = TRUE)
+      t <- trees[[i]]
+      name <- names(trees)[i]
+      dfnew <- filter(df, !is.na(syn2)) %>% as.data.frame()
+      drop <- t$tip.label[!t$tip.label %in% dfnew$Short]
+      t <-  drop.tip(t, drop)
+      syn2 <- get_orderd_trait(t=t, df=dfnew, var="syn2", treename="Short")
+      simmap_mod <- plot_simmap_onemod(
+        paste0("fig/05_simmap_syn2_ER_", name, ".pdf"),
+        syn2, tree = t, nsim=nsim, burnin=burnin,
+        samplefreq=samplefreq, model = "ER", cols = palette3,
+        piesize = 0.6, trans_tbl = df)
+      simmap_mod
+    }
+  # Save result to file:
+  saveRDS(simmaps_syn2_ER , "output/05_simmaps_syn2_ER.Rdata")
+}
+
+# Check if the file exists and load if not 
+if (!exists("simmaps_syn2_ER")){
+  simmaps_syn2_ER  <- readRDS("output/05_simmaps_syn2_ER.Rdata")
+}
+
+simmaps_syn2_ER  <- setNames(simmaps_syn2_ER , names(trees))
+
+par(mfrow=c(1,3))
+describe.simmap(simmaps_syn2_ER[[1]]$trees, plot=TRUE)
+describe.simmap(simmaps_syn2_ER[[2]]$trees, plot=TRUE)
+describe.simmap(simmaps_syn2_ER[[3]]$trees, plot=TRUE)
+
+## Calculate credible interval for each sample
+traitName <- "syn2_ER"
+
+for (i in 1:ltre) {
+  changes <- data.frame(simmaps_syn2_ER[[i]]$mod$count)
+  res <- c(traitName, names(trees)[[i]], length(simmaps_syn2_ER[[i]]$trees[[1]]$tip.label),
+           mean(changes$N),quantile(changes$N, c(cil,cih)), 
+           mean(changes$X0.1), quantile(changes$X0.1, c(cil,cih)),
+           mean(changes$X1.0), quantile(changes$X1.0, c(cil,cih)),
+           simmaps_syn2_ER[[i]]$mod$ace[1,1],
+           simmaps_syn2_ER[[i]]$mod$ace[1,2])
+  names(res) <- names(simmap_all_results)
+  simmap_syn2_results <- rbind(simmap_syn2_results, res)
+}
+simmap_syn2_results
+
+# Extract Q matrix
+Q_syn2_ER <- as.data.frame(
+rbind(extract_Q(simmaps_syn2_ER[[1]]$mod$tree),
+      extract_Q(simmaps_syn2_ER[[2]]$mod$tree),
+      extract_Q(simmaps_syn2_ER[[3]]$mod$tree)))
+Q_syn2_ER$tree <- rep(names(trees), each=2)
+Q_syn2_ER$MK_model <- "syn2_ER"
+
+Q_syn2 <- rbind(Q_syn2_nogain, Q_syn2_ARD, Q_syn2_ER)
+```
+
+
+```{r}
+write.csv(simmap_syn2_results, file = "output/05_simmap_syn2_results.csv")
+write.csv(model_comp_syn2, file = "output/05_simmap_model_comp_syn2.csv")
+write.csv(Q_syn2 , file = "output/05_simmap_Q_syn2.csv")
+```
+
+### output syn2
+TODO
+```{r}
+for (i in 1:ltre){
+REplot_simmap(file= paste0("fig/05_simmaps_inferred_syndrome2_nogain_",
+                           names(trees)[[i]], "_II.pdf"),
+var = "syn2", tree = trees[[i]], simmap =  simmaps_syn2_nogain[[i]],
+df = df, treename = "Short", cols = palette3, trans_tbl = df)
+  
+REplot_simmap(file= paste0("fig/05_simmaps_inferred_syndrome2_ARD_",
+                           names(trees)[[i]], "_II.pdf"),
+var = "syn2", tree = trees[[i]], simmap =  simmaps_syn2_ARD[[i]],
+df = df, treename = "Short", cols = palette3, trans_tbl = df)
+
+REplot_simmap(file= paste0("fig/05_simmaps_inferred_syndrome2_ER_",
+                           names(trees)[[i]], "_II.pdf"),
+var = "syn2", tree = trees[[i]], simmap =  simmaps_syn2_ER[[i]],
+df = df, treename = "Short", cols = palette3, trans_tbl = df)
+}
+```
+
+
+################################################################################
+
+# Combine results and output
+```{r}
+simmap_results3 <- rbind(simmap_Rec_results,
+                         simmap_bristle3_results,
+                         simmap_inferred_syndrome_results)
+simmap_results2 <- rbind(simmap_Rec2_results,
+                         simmap_bristle2_results,
+                         simmap_an2_results)
+model_comp <- rbind(model_comp_Rec3,
+                    model_comp_Rec2,
+                    model_comp_bristle3,
+                    model_comp_bristle2,
+                    model_comp_an2,
+                    model_comp_inferred_syndrome)
+
+Q2 <- rbind(Q_Rec2,Q_bristle2,Q_an2)
+
+write.csv(simmap_results3, file = "output/05_simmap_counts3.csv")
+write.csv(simmap_results2, file = "output/05_simmap_counts2.csv")
+write.csv(model_comp, file = "output/05_simmap_model_comp.csv")
+write.csv(Q_Rec_3states, file = "output/05_simmap_Q_Rec3.csv")
+write.csv(Q_bristle3, file = "output/05_simmap_Q_bristle3.csv")
+write.csv(Q_inferred_syndrome,file = "output/05_simmap_Q_inferred_syndrome.csv")
+write.csv(Q2, file = "output/05_simmap_Q2.csv")
+```
+
+
+
+# output ther trees but with missing data taxa included
+
+redrawing everything
+ TODO inferred syndrome
+
+## LOAD the data if needed
+
+
+```{r}
+simmaps_Rec_nogain_ord <- readRDS("output/05_simmaps_Rec_nogain_ord.Rdata")
+
+simmaps_inferred_syndrome_nogain_ord <- readRDS("output/05_simmaps_inferred_syndrome_nogain_ord.Rdata")
+```
+
+```{r}
+tree = trees[[i]]
+tree$tip.label <- gsub(pattern = "Macrostomum", replacement = "M.", x = tree$tip.label)
+
+cols1 = palette1
+piesize = 0.25
+label_offset = 0.02
+f_size = 0.9
+mod1 = simmaps_Rec_nogain_ord[[i]]
+prob_matrix1 <- to.matrix(trait1, sort(unique(trait1)))
+
+pdf("fig/simmap_habitat.pdf", width = 12, height = 12)
+
+
+plot(tree, type="fan",
+     show.tip.label = TRUE,
+     label.offset = label_offset,
+     cex = f_size, no.margin=TRUE,
+     edge.width = 1.5,
+     rotate.tree = 95,
+     open.angle = 2.5)
+  nodelabels(node=1:tree$Nnode+Ntip(tree),
+             pie=mod1$ace, piecol=cols1, cex=piesize)
+  tiplabels(pie=prob_matrix1, piecol=cols1, cex=piesize)
+    add.simmap.legend(leg = sort(unique(trait1)),
+                    colors=cols1, prompt=FALSE, x=-0.25, y=0.1, fsize=f_size+0.2,
+                    vertical = TRUE, cex=10)
+dev.off()
+```
+
+```{r}
+i=3
+REplot_simmap_fan(file= paste0("fig/EL_TEST_sym_",
+                           names(trees)[[i]], "_III.pdf"),
+var = "Rec", tree = trees[[i]], simmap =  simmaps_inferred_syndrome_nogain_ord[[i]],
+df = df, treename = "Short",
+cols = palette1,
+cols2 = c("#006837", "#78c679", "#ffffcc", "grey"), trans_tbl = df, type = "fan",
+label_offset = 0.04, piesize=0.3, f_size = 0.6)
+
+
+REplot_simmap_fan(file= paste0("fig/EL_TEST_",
+                           names(trees)[[i]], "_II.pdf"),
+var = "Rec", tree = trees[[i]], simmap =  simmaps_Rec_nogain_ord[[i]],
+df = df, treename = "Short", cols = palette1, trans_tbl = df, type = "fan",
+label_offset = 0.04, piesize=0.3, f_size = 0.6)
+
+
+
+
+
+```
+
+
+```{r}
+plot(trees$`C-IQ-TREE`, type="fan", show.tip.label = TRUE, cex=f_size,  label.offset = label_offset,
+       edge.width = 1.5,
+       rotate.tree = 100,
+       open.angle = 2.5)
+  nodelabels(node=node_loc[,2],
+             pie=simmap$mod$ace, piecol=cols, cex=piesize)
+  tiplabels(pie=prob_matrix, piecol=cols2, cex=piesize)
+```
+
+```{r}
+REplot_simmap_fan <- function(file, var, tree, simmap, df, treename, type = "phylogram",
+                              width=7, height=7, cols, cols2, label_offset = 0.04, f_size,
+                              label_size=1, title_size=1, margin= c(0,0,0,0), piesize=0.5, trans_tbl=NULL) {
+  
+  
+  drop <- tree$tip.label[!tree$tip.label %in% df[[treename]]]
+  t <-  drop.tip(tree, drop)
+  Ntips_scale <- length(t$tip.label)/100
+  # get trait
+  trait <- get_orderd_trait(t=t, df=df, var=var, treename=treename)
+  prob_matrix <- to.matrix(trait, sort(unique(trait)))
+  # find the nodes in the new tree
+  node_loc <- matchNodes(simmap$trees[[1]],t,"distances")
+  # Sci names (needs to be after node matching because that uses tips!)
+  if (!is.null(trans_tbl)) {
+    t$tip.label <-  trans_tbl$sci_name_short[match(t$tip.label, trans_tbl[[treename]])]
+    t$tip.label <- gsub(" ", "_", t$tip.label)
+  }
+  
+  pdf(file = file, width = width, height = height*Ntips_scale, useDingbats = FALSE)
+  par(mfrow=c(1,1), mar=margin, oma=c(0,0,0,0))
+  plot(t, type=type, show.tip.label = TRUE, cex=f_size,  label.offset = label_offset,
+       edge.width = 1.5,
+       rotate.tree = 100,
+       open.angle = 2.5)
+  nodelabels(node=node_loc[,2],
+             pie=simmap$mod$ace, piecol=cols, cex=piesize)
+  tiplabels(pie=prob_matrix, piecol=cols2, cex=piesize)
+  dev.off()
+}
+```
+
+
+```{r}
+REplot_simmap(file= paste0("fig/EL_simmaps_Rec_nogain_ord_",
+                           names(trees)[[i]], "_III.pdf"),
+var = "Rec", tree = trees[[i]], simmap =  simmaps_Rec_nogain_ord[[i]],
+df = df, treename = "Short", cols = palette1, trans_tbl = df, type = "fan")
+
+
+
+ls()[grepl("simmaps", ls())]
+
+# Rec
+for (i in 1:ltre){
+REplot_simmap(file= paste0("fig/EL_simmaps_Rec_nogain_ord_",
+                           names(trees)[[i]], "_II.pdf"),
+var = "Rec", tree = trees[[i]], simmap =  simmaps_Rec_nogain_ord[[i]],
+df = df, treename = "Short", cols = palette1, trans_tbl = df)
+
+REplot_simmap(file= paste0("fig/05_simmaps_Rec_ordered_ARD_",
+                           names(trees)[[i]], "_II.pdf"),
+var = "Rec", tree = trees[[i]], simmap =  simmaps_Rec_ordered_ARD[[i]],
+df = df, treename = "Short", cols = palette1, trans_tbl = df) 
+
+REplot_simmap(file= paste0("fig/05_simmaps_Rec_nogain_ARD_",
+                           names(trees)[[i]], "_II.pdf"),
+var = "Rec", tree = trees[[i]], simmap =  simmaps_Rec_nogain_ARD[[i]],
+df = df, treename = "Short", cols = palette1, trans_tbl = df) 
+
+REplot_simmap(file= paste0("fig/05_simmaps_Rec2_ARD_",
+                           names(trees)[[i]], "_II.pdf"),
+var = "Rec_binary", tree = trees[[i]], simmap =  simmaps_Rec2_ARD[[i]],
+df = df, treename = "Short", cols = palette3, trans_tbl = df)  
+
+REplot_simmap(file= paste0("fig/05_simmaps_Rec2_nogain_",
+                           names(trees)[[i]], "_II.pdf"),
+var = "Rec_binary", tree = trees[[i]], simmap =  simmaps_Rec2_nogain[[i]],
+df = df, treename = "Short", cols = palette3, trans_tbl = df) 
+}
+
+# bristle
+for (i in 1:ltre){
+REplot_simmap(file= paste0("fig/05_simmaps_bristle3_nogain_ord_",
+                           names(trees)[[i]], "_II.pdf"),
+var = "bristle", tree = trees[[i]], simmap =  simmaps_bristle3_nogain_ord[[i]],
+df = df, treename = "Short", cols = palette2, trans_tbl = df)
+
+REplot_simmap(file= paste0("fig/05_simmaps_bristle3_ord_",
+                           names(trees)[[i]], "_II.pdf"),
+var = "bristle", tree = trees[[i]], simmap =  simmaps_bristle3_ord[[i]],
+df = df, treename = "Short", cols = palette2, trans_tbl = df) 
+
+REplot_simmap(file= paste0("fig/05_simmaps_bristle3_nogain_",
+                           names(trees)[[i]], "_II.pdf"),
+var = "bristle", tree = trees[[i]], simmap =  simmaps_bristle3_nogain[[i]],
+df = df, treename = "Short", cols = palette2, trans_tbl = df) 
+
+REplot_simmap(file= paste0("fig/05_simmaps_bristle2_ARD_",
+                           names(trees)[[i]], "_II.pdf"),
+var = "bristle_binary", tree = trees[[i]], simmap =  simmaps_bristle2_ARD[[i]],
+df = df, treename = "Short", cols = palette3, trans_tbl = df)  
+
+REplot_simmap(file= paste0("fig/05_simmaps_bristle2_nogain_",
+                           names(trees)[[i]], "_II.pdf"),
+var = "bristle_binary", tree = trees[[i]], simmap =  simmaps_bristle2_nogain[[i]],
+df = df, treename = "Short", cols = palette3, trans_tbl = df) 
+}
+
+
+# antrum
+for (i in 1:ltre){
+REplot_simmap(file= paste0("fig/05_simmaps_an2_ARD_",
+                           names(trees)[[i]], "_II.pdf"),
+var = "an_binary", tree = trees[[i]], simmap =  simmaps_an2_ARD[[i]],
+df = df, treename = "Short", cols = palette3, trans_tbl = df)  
+
+REplot_simmap(file= paste0("fig/05_simmaps_an2_nogain_",
+                           names(trees)[[i]], "_II.pdf"),
+var = "an_binary", tree = trees[[i]], simmap =  simmaps_an2_nogain[[i]],
+df = df, treename = "Short", cols = palette3, trans_tbl = df) 
+}
+
+
+# inferred syndrome
+for (i in 1:ltre){
+REplot_simmap(file= paste0("fig/05_simmaps_inferred_syndrome_nogain_ord_",
+                           names(trees)[[i]], "_II.pdf"),
+var = "inferred_syndrome", tree = trees[[i]], simmap =  simmaps_inferred_syndrome_nogain_ord[[i]],
+df = df, treename = "Short", cols = palette2, trans_tbl = df)
+
+REplot_simmap(file= paste0("fig/05_simmaps_inferred_syndrome_ord_",
+                           names(trees)[[i]], "_II.pdf"),
+var = "inferred_syndrome", tree = trees[[i]], simmap =  simmaps_inferred_syndrome_ord[[i]],
+df = df, treename = "Short", cols = palette2, trans_tbl = df) 
+
+REplot_simmap(file= paste0("fig/05_simmaps_inferred_syndrome_nogain_",
+                           names(trees)[[i]], "_II.pdf"),
+var = "inferred_syndrome", tree = trees[[i]], simmap =  simmaps_inferred_syndrome_nogain[[i]],
+df = df, treename = "Short", cols = palette2, trans_tbl = df) 
+}
+```
+

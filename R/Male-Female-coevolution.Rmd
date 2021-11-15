@@ -1,0 +1,753 @@
+---
+title: "SA_exploration_LUK"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+require(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+opts_knit$set(root.dir = "..")
+```
+
+```{r message=FALSE, results="hide", warning=FALSE}
+source("R/functions.R")
+# pacman::p_load(ape, phytools, phangorn, purrr, tidyr, dplyr, ggplot2, ggtree, hisse, RColorBrewer, readxl, lattice, writexl, grid, gridExtra, gtable, ggstance))
+pkg <- c("ape", "phytools", "phangorn", "purrr", "tidyr", "dplyr", "ggplot2", "ggtree", "hisse", "RColorBrewer", "readxl", "lattice", "writexl", "grid", "gridExtra", "gtable", "ggstance", "coda", "foreach", "cowplot", "geiger", "BlambdaV", "viridis", "nlme", "rr2")
+lapply(pkg, require, character.only = TRUE)
+
+```
+
+
+## Load data
+
+```{r}
+## Load data
+
+m_df <- readxl::read_excel("Tab_S2.xlsx", sheet = 2, na = c("","NA"),
+                                 col_types = c("text", "text", rep("numeric",8)))
+
+
+s_df <- readxl::read_excel("Tab_S3.xlsx", sheet = 2, na = c("","NA"),
+                                  col_types = c(
+                                    rep("text",5),
+                                    rep("numeric",10),
+                                    "text",
+                                    rep("numeric",12),
+                                    "text"
+                                    )
+                                 )
+
+N_df <- readxl::read_excel("Tab_S1.xlsx", sheet = 2) %>%
+  mutate(
+    Species = gsub("M\\.", "Macrostomum", Species)
+  )
+```
+
+## Transform the data
+
+We want to do mean(log10(x)) *NOT* log(mean(x)). 
+Since the former is a much better representation of a species value.
+
+
+```{r}
+morpho_df <- m_df %>%
+  group_by(sci_name, ID) %>%
+  mutate_at(c("body_size"), funs(body_size_logsqrt = log10(sqrt(.)))) %>%
+  mutate_at(c("stylet_length", "stylet_proximal", "stylet_distal", "sperm_length", "bristle_length"),
+            funs(log = log10(.))) %>%
+  mutate_at(c( "bristle_length", "stylet_asymmetry"), funs(log = log10(. + 1)))
+
+morpho_df2 <- morpho_df %>%
+  group_by(sci_name) %>%
+  select(sci_name, contains("log"), stylet_curvyness) %>%
+  summarise_if(is.numeric, 
+               funs(mean = mean(., na.rm = TRUE), 
+                       N = sum(!is.na(.)))
+               ) %>%
+  mutate( sci_name_short = gsub(" ", "_", gsub("Macrostomum", "M.", sci_name)))
+```
+
+## LOAD TREES
+
+```{r}
+trees <- readRDS(file = paste0("trees.Rdata"))
+ltre <- length(trees)
+
+# Color the hypodermic clade
+t_injecting_clade <- extract.clade(trees[[3]],154)
+names_injecting <- t_injecting_clade$tip.label
+
+s_df$clade <- ifelse(s_df$Short %in% names_injecting, "clade1", "clade2")
+
+species_df <- s_df %>%
+  mutate(sci_name_short = gsub(" ", "_", gsub("Macrostomum", "M.", Species)),
+         inferred_syndrome_2states = case_when(
+           inferred_syndrome == "intermediate" ~ "hypodermic",
+           TRUE ~ inferred_syndrome)
+         ) %>%
+  select(-contains("mean"))
+
+# Some in the species list have not been measured
+species_df$Species %in% morpho_df2$sci_name
+sum(species_df$Species %in% morpho_df2$sci_name)
+
+# All measured are in the species list
+morpho_df2$sci_name %in% species_df$Species
+
+# Combine them
+main_df <- left_join(species_df, morpho_df2, by = "sci_name_short")
+
+length(species_df$Short)
+species_df$Short %in% trees[[3]]$tip.label
+
+```
+
+## Color palette
+
+```{r}
+Nclusters=3
+cl <- parallel::makeCluster(Nclusters)
+doParallel::registerDoParallel(cl)
+library(foreach)
+
+pr = "#006837"
+int = "#78c679"
+ab = "#ffffcc"
+
+palette1 <- c(pr, int, ab, "grey")
+palette2 <- c(ab, int, pr, "grey")
+palette3 <- c(ab, pr, "grey")
+```
+
+
+### multiply trees by 100 
+
+The ML optimizer can run into issues due to numeric underflow. 
+
+```{r}
+trees <- lapply(trees,function(tre){tre$edge.length <- tre$edge.length * 100; return(tre)})
+```
+
+Make sure we are using factors
+
+```{r}
+main_df <- main_df %>%
+  mutate(Rec_binary = factor(Rec_binary, levels = c(0,1)),
+         bristle_binary = factor(bristle_binary, levels = c(0,1)),
+         inferred_syndrome_2states = factor(inferred_syndrome_2states, 
+                                            levels = c("hypodermic","reciprocal")))
+```
+
+# Prepare data for PCA
+
+We want to use both the catgorical as well as the quantitative traits.
+To make them comparable they need to be scaled. So all traits will be transformed
+to be between 0 and 1. 
+
+```{r}
+# In previous version things had different names
+main_df <- main_df %>%
+  rename(
+    brstlLen_um_per_sperm_log_mean = bristle_length_log_mean,
+    bdSize_um_logsqrt_mean = body_size_logsqrt_mean, 
+    sty_avg_um_log_mean = stylet_length_log_mean,
+    wb_um_log_mean = stylet_proximal_log_mean,
+    wt_um_log_mean = stylet_distal_log_mean,
+    delta_e_um_log_mean = stylet_asymmetry_log_mean,
+    total_sprmLen_um_log_mean = sperm_length_log_mean,
+    sty_curveSum_avg_mean = stylet_curvyness_mean
+  )
+  
+
+  
+var_of_interest <- c("brstlLen_um_per_sperm_log_mean",
+  "bdSize_um_logsqrt_mean", 
+  "sty_avg_um_log_mean", "wb_um_log_mean", "wt_um_log_mean", "delta_e_um_log_mean",
+  "total_sprmLen_um_log_mean","eye", "Rec", 
+  "ant_thickness", "ant_cellular_valve", 
+  "ant_chambers", "No_openings",
+  "bristle", "brush", "velum",
+   "sharp", "an_complex_noc_noo")
+
+var_of_interest[!var_of_interest %in% names(main_df)]
+```
+
+# Prepare data for PCA
+
+We want to use both the catgorical as well as the quantitative traits.
+To make them comparable they need to be scaled. So all traits will be transformed
+to be between 0 and 1. 
+
+```{r}
+var_of_interest <- c("brstlLen_um_per_sperm_log_mean",
+  "bdSize_um_logsqrt_mean", 
+  "sty_avg_um_log_mean", "wb_um_log_mean", "wt_um_log_mean", "delta_e_um_log_mean",
+  "total_sprmLen_um_log_mean","eye", "Rec", 
+  "ant_thickness", "ant_cellular_valve", 
+  "ant_chambers", "No_openings",
+  "bristle", "brush", "velum",
+   "sharp", "an_complex_noc_noo")
+
+
+quant_df <- main_df %>%
+  select(Short,one_of(var_of_interest)) %>%
+  rowwise() %>%
+  as.data.frame()
+
+scaled_df <- quant_df %>%
+  mutate_if(is.numeric, funs(scales::rescale), to=c(0,1)) %>%
+  rowwise() %>%
+  as.data.frame()
+
+row.names(quant_df) <- quant_df$Short
+row.names(scaled_df) <- scaled_df$Short
+```
+
+
+Mark clade
+```{r}
+# This is dependent on this version of the 28S tree! 
+t_injecting_clade <- extract.clade(trees[[3]],154)
+names_injecting <- t_injecting_clade$tip.label
+
+main_df$clade <- ifelse(main_df$Short %in% names_injecting, "clade1", "clade2")
+```
+
+
+Make sure we are using factors
+
+```{r}
+main_df <- main_df %>% 
+  mutate(Rec_binary = factor(Rec_binary, levels = c(0,1)),
+         bristle_binary = factor(bristle_binary, levels = c(0,1)),
+         sci_name_short = gsub(" ", "_", gsub("Macrostomum", "M.", Species)),
+         inferred_syndrome_2states = case_when(
+           inferred_syndrome == "intermediate" ~ "hypodermic",
+           TRUE ~ inferred_syndrome
+         )) %>%
+  mutate(sharp = as.factor(sharp)) %>%
+  mutate(taxa = sci_name_short) %>%
+  as.data.frame()
+```
+
+# PCA 
+
+## Antrum 
+
+```{r}
+i = 3
+treename = "Short"
+ppca_antrum <- main_df %>%
+  select(Short,ant_thickness, ant_cellular_valve, ant_chambers, No_openings) %>%
+  prepare_phyl_pca(tree = trees[[i]])
+
+ignore = c("")
+tmp_df <- ppca_antrum[[1]][,setdiff(names(ppca_antrum[[1]]), c(treename, ignore))]
+t <- ppca_antrum[[2]]
+
+pPCA_1 <- phyl.pca(t, tmp_df, method = "lambda", mode="corr")
+pPCA_1_L <- as.data.frame(pPCA_1$L) %>%
+  mutate(var = rownames(pPCA_1$L))
+
+pPCA_1_S <- as.data.frame(pPCA_1$S)  %>%
+  mutate(Short = rownames(pPCA_1$S))
+
+pPCA_p1 <- ggplot(as.data.frame(pPCA_1$S), aes(x = PC1, y=PC2)) +
+  geom_point(size=4) 
+
+summary(pPCA_1)
+round(pPCA_1_L$PC1,2)
+```
+
+## Stylet
+
+```{r}
+ppca_stylet <- main_df %>%
+    select(Short, sty_avg_um_log_mean,
+           sty_curveSum_avg_mean, wb_um_log_mean, wt_um_log_mean,
+           delta_e_um_log_mean) %>%
+  prepare_phyl_pca(tree = trees[[i]])
+
+ignore = c("")
+tmp_df <- ppca_stylet[[1]][,setdiff(names(ppca_stylet[[1]]), c(treename, ignore))]
+t <- ppca_stylet[[2]]
+
+pPCA_2 <- phyl.pca(t, tmp_df, method = "lambda", mode="corr")
+pPCA_2_L <- as.data.frame(pPCA_2$L) %>%
+  mutate(var = rownames(pPCA_2$L))
+
+pPCA_2_S <- as.data.frame(pPCA_2$S)  %>%
+  mutate(Short = rownames(pPCA_2$S))
+
+pPCA_p2 <- ggplot(as.data.frame(pPCA_2$S), aes(x = PC1, y=PC2)) +
+  geom_point(size=4)
+
+summary(pPCA_2)
+round(pPCA_2_L$PC1,2)
+```
+
+Join the two PCA results
+
+```{r}
+pPCA_1
+pPCA_2
+
+names(pPCA_1_S) <- c("anPC1", "anPC2", "anPC3", "anPC4", "Short")
+# reverse them to make them easier to think about
+pPCA_1_S$anPC1 <- pPCA_1_S$anPC1 * -1 
+
+
+names(pPCA_2_S) <- c("styPC1", "styPC2", "styPC3", "styPC4", "styPC5", "Short")
+# pPCA_2_S$styPC1 <- pPCA_2_S$styPC1 * -1 
+
+PCA_df <- left_join(pPCA_1_S, pPCA_2_S) %>%
+  na.omit() %>%
+  left_join(select(main_df, Short, inferred_syndrome,inferred_syndrome_2states))
+
+ggplot(PCA_df, aes(x = anPC1, y=styPC1, fill=inferred_syndrome)) +
+    geom_point(size=4, pch=21) 
+```
+
+# PGLS test of PCA first axis
+
+## Across all species
+
+```{r}
+formula = "styPC1 ~ anPC1"
+N_var = ""
+predictor <- "styPC1"
+pred <- "anPC1"
+treename = "Short"
+cor_form = "~ Short"
+DIAGNOSTIC = FALSE
+
+pgls_styPC1_anPC1_all <- list()
+pgls_styPC1_anPC1_all_models <- list()
+for (j in 1:3){
+  # Calculate pPCA antrum
+  ppca_antrum <- main_df %>%
+  select(Short,ant_thickness, ant_cellular_valve, ant_chambers, No_openings) %>%
+  prepare_phyl_pca(tree = trees[[j]])
+  ignore = c("")
+  tmp_df <- ppca_antrum[[1]][,setdiff(names(ppca_antrum[[1]]), c(treename, ignore))]
+  t <- ppca_antrum[[2]]
+  pPCA_1 <- phyl.pca(t, tmp_df, method = "lambda", mode="corr")
+  pPCA_1_L <- as.data.frame(pPCA_1$L) %>%
+    mutate(var = rownames(pPCA_1$L))
+
+  pPCA_1_S <- as.data.frame(pPCA_1$S)  %>%
+    mutate(Short = rownames(pPCA_1$S))
+  
+  # Calculate pPCA stylet 
+  ppca_stylet <- main_df %>%
+    select(Short, sty_avg_um_log_mean,
+           sty_curveSum_avg_mean, wb_um_log_mean, wt_um_log_mean,
+           delta_e_um_log_mean) %>%
+    prepare_phyl_pca(tree = trees[[j]])
+  ignore = c("")
+  tmp_df <- ppca_stylet[[1]][,setdiff(names(ppca_stylet[[1]]), c(treename, ignore))]
+  t <- ppca_stylet[[2]]
+  
+
+  pPCA_2 <- phyl.pca(t, tmp_df, method = "lambda", mode="corr")
+  pPCA_2_L <- as.data.frame(pPCA_2$L) %>%
+    mutate(var = rownames(pPCA_2$L))
+
+  pPCA_2_S <- as.data.frame(pPCA_2$S)  %>%
+    mutate(Short = rownames(pPCA_2$S))
+  
+  # join PCA dfs.
+  names(pPCA_1_S) <- c("anPC1", "anPC2", "anPC3", "anPC4", "Short")
+  names(pPCA_2_S) <- c("styPC1", "styPC2", "styPC3", "styPC4", "styPC5", "Short")
+    # reverse them to make them easier to think about
+  pPCA_1_S$anPC1 <- pPCA_1_S$anPC1 * -1 
+  pPCA_1_S$anlambda <- round(pPCA_1$lambda, 2)
+  pPCA_1_L$PC1 <- pPCA_1_L$PC1 * -1 
+  #pPCA_2_S$styPC1 <- pPCA_2_S$styPC1 * -1 
+  pPCA_2_S$stylambda <- round(pPCA_2$lambda, 2)
+  #pPCA_2_L$PC1 <- pPCA_2_L$PC1 * -1 
+  
+  PCA_df <- left_join(pPCA_1_S, pPCA_2_S) %>%
+    na.omit() %>%
+    left_join(select(main_df, Short, sci_name_short, inferred_syndrome, inferred_syndrome_2states))
+  
+  write.csv(PCA_df, file=paste0("output/EL_PCA_df_", names(trees)[[3]],".csv"))
+  # Output loadings and scores
+  write.csv(pPCA_1_L, file=paste0("output/EL_anPC_L_", names(trees)[[j]],".csv"), row.names = FALSE)
+  
+  pPCA_1_S %>%
+    left_join(select(main_df, Short, sci_name_short)) %>%
+    #mutate_if(is.numeric, round, 2) %>%
+    select(sci_name_short, contains("PC"), anlambda) %>%
+    rename(lambda = anlambda) %>%
+    write.csv(file=paste0("output/EL_anPC_S_", names(trees)[[j]],".csv"), row.names = FALSE)
+
+  write.csv(pPCA_2_L, file=paste0("output/EL_styPC_L_", names(trees)[[j]],".csv"), row.names = FALSE)
+  
+  pPCA_2_S %>%
+    left_join(select(main_df, Short, sci_name_short)) %>%
+    #mutate_if(is.numeric, round, 2) %>%
+    select(sci_name_short, contains("PC"), stylambda) %>%
+    rename(lambda = stylambda) %>%
+    write.csv(file=paste0("output/EL_styPC_S_", names(trees)[[j]],".csv"), row.names = FALSE)
+
+  ggplot(PCA_df, aes(x = anPC1, y=styPC1, fill=inferred_syndrome)) +
+  geom_point(size=4, pch=21) 
+  
+  # PGLS
+  comp_df <- PCA_df %>%
+    select(Short, pred, predictor, inferred_syndrome) %>%
+  prepare_phyl_pca(tree = trees[[j]], treename = "Short")
+  
+  # Script for model testing is omitted here since the lambda model was always preferred.
+  # See PGLS.Rmd for details.
+  
+  lambda <- tryCatch(
+    {gls(as.formula(formula), data = comp_df[[1]], 
+                 correlation = corPagel(1, phy=comp_df[[2]], form = as.formula(cor_form)), 
+                  method = "REML",
+                control=list(maxIter=500))},
+    error=function(cond){
+      print(cond)
+      optimal_lambda <- optimize_lambda(
+        formula=as.formula(formula), data = comp_df[[1]], phy=comp_df[[2]], form = as.formula(cor_form),
+         method = "REML", control=list(), weight = NULL)
+      gls(as.formula(formula), data = comp_df[[1]], 
+                 correlation = corPagel(optimal_lambda, 
+                                        phy=comp_df[[2]], fixed=TRUE, form = as.formula(cor_form)), 
+                 method = "REML",
+                 control=list(maxIter=500))})
+
+
+  ############
+  mod0 <- gls(as.formula("styPC1 ~ 1"), data = comp_df[[1]], 
+                 correlation = corPagel(1,
+                                        phy=comp_df[[2]], form = ~Short),
+                 method = "REML",
+                control=list(maxIter=500))
+  
+  full =   lambda 
+  phy_only = mod0
+  data_only = lm(as.formula(formula), data = comp_df[[1]])
+  R2_pred_data = round(R2.pred(full, phy_only),3)
+  R2_pred_phy = round(R2.pred(full, data_only),3)
+  R2_pred_full = round(R2.pred(full),3)
+  
+  #####################
+  s_best <- summary(lambda)
+  res_df <- data.frame(s_best$tTable)
+  res_df$Estimate <- rownames(s_best$tTable)
+  res_df$model <- "lambda"
+  res <- res_df
+  res$R2pred <- c(R2_pred_full, rep(R2_pred_data, nrow(res)-1))
+  
+  res$predictor = pred
+  res$phylogeny = names(trees)[[j]]
+  res$lambda = lambda$modelStruct[[1]]
+  res$N = nrow(comp_df[[1]])
+  #############
+  # DIAGNOSTICS
+  if (DIAGNOSTIC == TRUE) {
+    png(paste0("fig/diag/",outname, "_", names(trees)[j],"_",preds[i],".png"),
+      width = 7, height = 7, unit="in", res = 300)
+    pgls_diag_gls(name=paste0(names(trees)[j]," ",predictor), mod_type = "lambda",
+                model=lambda, formula=as.formula(formulas[[i]]),
+                data = comp_df[[1]], phy=comp_df[[2]], 
+                weight = as.formula(N_var), method = "REML", control=list(maxIter=500, opt="optim"))
+    dev.off()
+  }
+
+  ############
+  pgls_styPC1_anPC1_all <- append(pgls_styPC1_anPC1_all,list(res))
+  pgls_styPC1_anPC1_all_models <- append(pgls_styPC1_anPC1_all_models, list(lambda))
+}
+
+
+
+main_res <- do.call(rbind, pgls_styPC1_anPC1_all)
+main_res$p.value <- format.pval(main_res$p.value, eps=0.001, digits=2)
+main_res_out <- main_res %>%
+  select(predictor, phylogeny, Estimate, N, lambda, Value, Std.Error, t.value, p.value, R2pred) %>%
+  mutate_if(is.numeric, round, 2)
+
+
+
+write.csv(main_res_out, file="output/EL_styPC1_anPC1_all_PGLS.csv")
+
+names(pgls_styPC1_anPC1_all_models) <- apply(expand.grid(names(trees)[1:3], pred), 1, paste, collapse="_")
+
+saveRDS(pgls_styPC1_anPC1_all_models, "output/EL_styPC1_anPC1_all_PGLS.RDS")
+```
+
+## Reciprocal species only
+
+```{r}
+formula = "styPC1 ~ anPC1"
+N_var = ""
+predictor <- "styPC1"
+pred <- "anPC1"
+treename = "Short"
+cor_form = "~ Short"
+DIAGNOSTIC = FALSE
+
+pgls_styPC1_anPC1_reciprocal <- list()
+pgls_styPC1_anPC1_reciprocal_models <- list()
+for (j in 1:3){
+  # Calculate pPCA antrum
+  ppca_antrum <- main_df %>%
+  select(Short,ant_thickness, ant_cellular_valve, ant_chambers, No_openings) %>%
+  prepare_phyl_pca(tree = trees[[j]])
+  ignore = c("")
+  tmp_df <- ppca_antrum[[1]][,setdiff(names(ppca_antrum[[1]]), c(treename, ignore))]
+  t <- ppca_antrum[[2]]
+  pPCA_1 <- phyl.pca(t, tmp_df, method = "lambda", mode="corr")
+  pPCA_1_L <- as.data.frame(pPCA_1$L) %>%
+    mutate(var = rownames(pPCA_1$L))
+
+  pPCA_1_S <- as.data.frame(pPCA_1$S)  %>%
+    mutate(Short = rownames(pPCA_1$S))
+  
+  # Calculate pPCA stylet 
+  ppca_stylet <- main_df %>%
+    select(Short, sty_avg_um_log_mean,
+           sty_curveSum_avg_mean, wb_um_log_mean, wt_um_log_mean,
+           delta_e_um_log_mean) %>%
+    prepare_phyl_pca(tree = trees[[j]])
+  ignore = c("")
+  tmp_df <- ppca_stylet[[1]][,setdiff(names(ppca_stylet[[1]]), c(treename, ignore))]
+  t <- ppca_stylet[[2]]
+  
+
+  pPCA_2 <- phyl.pca(t, tmp_df, method = "lambda", mode="corr")
+  pPCA_2_L <- as.data.frame(pPCA_2$L) %>%
+    mutate(var = rownames(pPCA_2$L))
+
+  pPCA_2_S <- as.data.frame(pPCA_2$S)  %>%
+    mutate(Short = rownames(pPCA_2$S))
+  
+  # join PCA dfs.
+  names(pPCA_1_S) <- c("anPC1", "anPC2", "anPC3", "anPC4", "Short")
+  names(pPCA_2_S) <- c("styPC1", "styPC2", "styPC3", "styPC4", "styPC5", "Short")
+    # reverse them to make them easier to think about
+  pPCA_1_S$anPC1 <- pPCA_1_S$anPC1 * -1 
+  pPCA_1_S$anlambda <- round(pPCA_1$lambda, 2)
+  pPCA_1_L$PC1 <- pPCA_1_L$PC1 * -1 
+  #pPCA_2_S$styPC1 <- pPCA_2_S$styPC1 * -1 
+  pPCA_2_S$stylambda <- round(pPCA_2$lambda, 2)
+  #pPCA_2_L$PC1 <- pPCA_2_L$PC1 * -1 
+  
+  PCA_df <- left_join(pPCA_1_S, pPCA_2_S) %>%
+    na.omit() %>%
+    left_join(select(main_df, Short, sci_name_short, inferred_syndrome, inferred_syndrome_2states))
+  
+  # Output loadings and scores
+  # write.csv(pPCA_1_L, file=paste0("output/11_anPC_L_", names(trees)[[j]],".csv"), row.names = FALSE)
+  # 
+  # pPCA_1_S %>%
+  #   left_join(select(main_df, Short, sci_name_short)) %>%
+  #   #mutate_if(is.numeric, round, 2) %>%
+  #   select(sci_name_short, contains("PC"), anlambda) %>%
+  #   rename(lambda = anlambda) %>%
+  #   write.csv(file=paste0("output/EL_anPC_S_", names(trees)[[j]],".csv"), row.names = FALSE)
+  # 
+  # write.csv(pPCA_2_L, file=paste0("output/EL_styPC_L_", names(trees)[[j]],".csv"), row.names = FALSE)
+  # 
+  # pPCA_2_S %>%
+  #   left_join(select(main_df, Short, sci_name_short)) %>%
+  #   #mutate_if(is.numeric, round, 2) %>%
+  #   select(sci_name_short, contains("PC"), stylambda) %>%
+  #   rename(lambda = stylambda) %>%
+  #   write.csv(file=paste0("output/EL_styPC_S_", names(trees)[[j]],".csv"), row.names = FALSE)
+
+  # ggplot(PCA_df, aes(x = anPC1, y=styPC1, fill=inferred_syndrome)) +
+  # geom_point(size=4, pch=21) 
+  # 
+  # PGLS
+  comp_df <- PCA_df %>%
+    filter(inferred_syndrome == "reciprocal") %>%
+    select(Short, pred, predictor, inferred_syndrome) %>%
+  prepare_phyl_pca(tree = trees[[j]], treename = "Short")
+  
+  # Script for model testing is omitted here since the lambda model was always preferred.
+  # See PGLS.Rmd for details.
+  
+  lambda <- tryCatch(
+    {gls(as.formula(formula), data = comp_df[[1]], 
+                 correlation = corPagel(1, phy=comp_df[[2]], form = as.formula(cor_form)), 
+                  method = "REML",
+                control=list(maxIter=500))},
+    error=function(cond){
+      print(cond)
+      optimal_lambda <- optimize_lambda(
+        formula=as.formula(formula), data = comp_df[[1]], phy=comp_df[[2]], form = as.formula(cor_form),
+         method = "REML", control=list(), weight = NULL)
+      gls(as.formula(formula), data = comp_df[[1]], 
+                 correlation = corPagel(optimal_lambda, 
+                                        phy=comp_df[[2]], fixed=TRUE, form = as.formula(cor_form)), 
+                 method = "REML",
+                 control=list(maxIter=500))})
+
+
+  ############
+  mod0 <- gls(as.formula("styPC1 ~ 1"), data = comp_df[[1]], 
+                 correlation = corPagel(1,
+                                        phy=comp_df[[2]], form = ~Short),
+                 method = "REML",
+                control=list(maxIter=500))
+  
+  full =   lambda 
+  phy_only = mod0
+  data_only = lm(as.formula(formula), data = comp_df[[1]])
+  R2_pred_data = round(R2.pred(full, phy_only),3)
+  R2_pred_phy = round(R2.pred(full, data_only),3)
+  R2_pred_full = round(R2.pred(full),3)
+  
+  #####################
+  s_best <- summary(lambda)
+  res_df <- data.frame(s_best$tTable)
+  res_df$Estimate <- rownames(s_best$tTable)
+  res_df$model <- "lambda"
+  res <- res_df
+  res$R2pred <- c(R2_pred_full, rep(R2_pred_data, nrow(res)-1))
+  
+  res$predictor = pred
+  res$phylogeny = names(trees)[[j]]
+  res$lambda = lambda$modelStruct[[1]]
+  res$N = nrow(comp_df[[1]])
+  #############
+  # DIAGNOSTICS
+  if (DIAGNOSTIC == TRUE) {
+    png(paste0("fig/diag/",outname, "_", names(trees)[j],"_",preds[i],".png"),
+      width = 7, height = 7, unit="in", res = 300)
+    pgls_diag_gls(name=paste0(names(trees)[j]," ",predictor), mod_type = "lambda",
+                model=lambda, formula=as.formula(formulas[[i]]),
+                data = comp_df[[1]], phy=comp_df[[2]], 
+                weight = as.formula(N_var), method = "REML", control=list(maxIter=500, opt="optim"))
+    dev.off()
+  }
+
+  ############
+  pgls_styPC1_anPC1_reciprocal <- append(pgls_styPC1_anPC1_reciprocal,list(res))
+  pgls_styPC1_anPC1_reciprocal_models <- append(pgls_styPC1_anPC1_reciprocal_models, list(lambda))
+}
+
+
+
+main_res <- do.call(rbind, pgls_styPC1_anPC1_reciprocal)
+main_res$p.value <- format.pval(main_res$p.value, eps=0.001, digits=2)
+main_res_out <- main_res %>%
+  select(predictor, phylogeny, Estimate, N, lambda, Value, Std.Error, t.value, p.value, R2pred) %>%
+  mutate_if(is.numeric, round, 2)
+
+
+write.csv(main_res_out, file="output/EL_styPC1_anPC1_reciprocal_PGLS.csv")
+
+names(pgls_styPC1_anPC1_reciprocal_models) <- apply(expand.grid(names(trees)[1:3], pred), 1, paste, collapse="_")
+
+saveRDS(pgls_styPC1_anPC1_reciprocal_models, "output/EL_styPC1_anPC1_reciprocal_PGLS.RDS")
+```
+
+# Plot for the C-IQ-TREE results
+
+Load models
+
+```{r}
+pPCA_all_models   <- readRDS("output/EL_styPC1_anPC1_all_PGLS.RDS")
+pPCA_reciprocal_models <- readRDS("output/EL_styPC1_anPC1_reciprocal_PGLS.RDS")
+PCA_df <- read.csv(file=paste0("output/EL_PCA_df_", names(trees)[[3]],".csv"))
+
+an_PCA_L <- read.csv(file = "output/EL_anPC_L_C-IQ-TREE.csv")
+sty_PCA_L <- read.csv(file = "output/EL_styPC_L_C-IQ-TREE.csv")
+
+```
+
+Show loadings
+```{r}
+
+an_heatp <-   an_PCA_L %>%
+  gather(key = PC, value = val, PC1) %>%
+  mutate(var = factor(var, levels = rev(unique(an_PCA_L$var)))) %>%
+  ggplot(aes(x = PC, y = var)) +
+  geom_tile(aes(fill=val)) +
+  geom_text(aes(label=round(val,2)), size =6) + 
+  scale_fill_gradient2(low="royalblue", mid="white", high="firebrick1", limits=c(-1,1)) +
+  scale_y_discrete(labels = 
+  c('No. genital pores','Chamber complexity','Cellular valve', 'Thickness')) +
+  scale_x_discrete(labels = "PC1 (46.9%)") +
+  theme(legend.position = "none",
+        axis.title = element_blank())
+
+sty_heatp <-   sty_PCA_L %>%
+  gather(key = PC, value = val, PC1) %>%
+  mutate(var = factor(var, levels = rev(unique(sty_PCA_L$var)))) %>%
+  ggplot(aes(x = PC, y = var)) +
+  geom_tile(aes(fill=val)) +
+  geom_text(aes(label=round(val,2)), size =6) + 
+  scale_fill_gradient2(low="royalblue", mid="white", high="firebrick1", limits=c(-1,1)) +
+  scale_y_discrete(labels = 
+  c('Distal asymmetry','Width distal','Width proximal', 'Curviness', 'Stylet length')) +
+  scale_x_discrete(labels = "PC1 (38.6%)") +
+  theme(legend.position = "none",
+        axis.title = element_blank())
+p_loadings <- plot_grid(sty_heatp, an_heatp, ncol = 1, align = "v")
+  
+```
+
+# Plotting the results
+
+```{r}
+formula = "styPC1 ~ anPC1"
+N_var = ""
+predictor <- "styPC1"
+pred <- "anPC1"
+treename = "Short"
+
+
+preds <- list("styPC1")
+j=3
+pdf(file = "fig/EL_PGLS_pPCA_anPC1_styPC1.pdf", useDingbats = FALSE)
+
+comp_df <- list()
+comp_df[[1]] <- PCA_df 
+# parameters to plot slopes
+mod <- pPCA_all_models[["C-IQ-TREE_anPC1"]]
+inter <- mod$coefficients[[1]]; slope <- mod$coefficients[[2]]
+xlow <-  min(comp_df[[1]][pred])
+xhigh <-  max(comp_df[[1]][pred])
+ylow <- inter + xlow * slope; yhigh <- inter + xhigh * slope
+
+# 
+R_mod <- pPCA_reciprocal_models[["C-IQ-TREE_anPC1"]]
+R_inter <- R_mod$coefficients[[1]]; R_slope <- R_mod$coefficients[[2]]
+R_xlow <-  min(
+  filter(comp_df[[1]], inferred_syndrome == "reciprocal")[pred])
+R_xhigh <-  max(
+  filter(comp_df[[1]], inferred_syndrome == "reciprocal")[pred])
+R_ylow <- R_inter + R_xlow * R_slope; R_yhigh <- R_inter + R_xhigh * R_slope
+
+gplot <- ggplot(comp_df[[1]], aes_string(x=pred, y="styPC1",
+                         fill = "inferred_syndrome")) +
+  geom_segment(x = xlow, xend = xhigh, y = ylow, yend = yhigh, size=1) +
+  geom_segment(x = R_xlow, xend = R_xhigh, y = R_ylow, yend = R_yhigh,
+               linetype = "dashed", size=1) +
+  geom_point(size=3, shape=21, stroke=1) +
+  scale_fill_manual(values=palette2) +
+  scale_shape_manual(values=c(21,24,22,21)) +
+  ylab("Stylet PC1") +
+  xlab("Antrum PC1") +
+  theme_cowplot() +
+  theme(legend.position=c(.05, 0.9),
+        legend.title = element_blank())
+
+dev.off()
+
+```
+
+
+```{r}
+pdf("fig/EL_sty_an_PCA_loadings.pdf", width = 10, height = 7)
+plot_grid(p_loadings,
+          gplot, rel_widths = c(3,7), align = "h")
+dev.off()
+```
+

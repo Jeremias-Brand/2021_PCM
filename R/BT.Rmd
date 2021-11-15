@@ -1,0 +1,662 @@
+---
+title: "BT_mating"
+author: "Jeremias Brand"
+date: "4 August 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r message=FALSE, results="hide", warning=FALSE}
+source("R/functions.R")
+# pacman::p_load(ape, phytools, phangorn, purrr, tidyr, dplyr, ggplot2, ggtree, hisse, RColorBrewer, readxl, lattice, writexl, grid, gridExtra, gtable, ggstance))
+pkg <- c("ape", "phytools", "phangorn", "purrr", "tidyr", "dplyr", "ggplot2", "ggtree", "hisse", "RColorBrewer", "readxl", "lattice", "writexl", "grid", "gridExtra", "gtable", "ggstance", "coda", "foreach", "cowplot", "data.table")
+lapply(pkg, require, character.only = TRUE)
+
+```
+
+
+```{r}
+stats_all <- fread("output/06_BT_statistics_all_runs.csv", stringsAsFactors = FALSE)
+quant_all <- read.csv("output/06_BT_quantiles_all_runs.csv", stringsAsFactors = FALSE)
+Lh_all <- read.csv("output/06_BT_BF_all_runs.csv", stringsAsFactors = FALSE)
+```
+
+## We want to vizualize the transition rates for all models
+
+There are 27 separate tests so we should ideally not have to plot them completely manually
+
+
+```{r}
+v <- unique(stats_all$varnames)
+t <- unique(stats_all$tree)
+p <- unique(stats_all$prior)
+```
+
+
+```{r}
+library(diagram)
+varN <- unique(stats_all$varnames)
+display_names <- c("sperm: antrum only/some hypodermic 1/0\n long bristle/reduced bristle 1/0",
+                   "sperm: antrum only/hypodermic sperm present 1/0\n antrum thick/antrum simple 1/0",
+                   "long bristle/reduced bristle 1/0\nantrum thick/antrum simple 1/0")
+trees <- unique(stats_all$tree)
+tree_names <- c("H-IQ-TREE", "H-ExaBayes", "C-IQ-TREE")
+priors <- unique(stats_all$prior)
+stats_all$Mean <- round(stats_all$Mean,1)
+stats_all <- data.table(stats_all)
+
+transitions <- c("q12","q13","q21","q24","q31","q34","q42","q43")
+# three trees and three priors so we should have a 3x3 grid
+pdf("fig/06_Transition_matrix_raw_v02.pdf", height = 10, width = 7, paper = "a4")
+par(mfrow=c(3,3),
+    mar=c(0,0,5,0))
+for (i in 1:length(varN)){
+  for (j in 1:length(trees)){
+    for (k in 1:length(priors)){
+    model <- stats_all[varnames == varN[[i]] &
+                         tree == trees[j] &
+                         prior == priors[k] &
+                         model == "dependent" &
+                       .rownames %in% transitions]
+    
+    BF <- data.table(Lh_all)[VARNAMES == varN[i] &
+                         t_name == trees[j] &
+                         prN == priors[k], "marginalLH_BF"]
+    
+    LH_ind <- data.table(Lh_all)[VARNAMES == varN[i] &
+                         t_name == trees[j] &
+                         prN == priors[k], "mean_marginalLH_independent"]
+    
+    LH_dep <- data.table(Lh_all)[VARNAMES == varN[i] &
+                         t_name == trees[j] &
+                         prN == priors[k], "mean_marginalLH_dependent"]
+                 
+    trs <- model[,"Mean"]
+    trs_num <- scales::rescale(as.numeric(trs$Mean), to=c(1,5))
+    nms <- c("00","01","10","11")
+    m <- matrix(
+    c(0,trs[1],trs[2],0,
+    trs[3],0,0,trs[4],
+    trs[5],0,0,trs[6],
+    0,trs[7],trs[8],0),
+    nrow = 4, dimnames = list(nms,nms))
+    # make an arrow sclaing vector
+    m_arr <- matrix(
+    c(0,trs_num[1],trs_num[2],0,
+    trs_num[3],0,0,trs_num[4],
+    trs_num[5],0,0,trs_num[6],
+    0,trs_num[7],trs_num[8],0),
+    nrow = 4)
+    mn <- apply(m,1,as.numeric)
+    apply(mn,MARGIN=1, scales::rescale)
+        Lines <- list(bquote(.(tree_names[j])),
+                  bquote(paste("Lh" ["ind"], ":", .(LH_ind[[1]]))),
+                  bquote(paste("Lh" ["dep"], ":", .(LH_dep[[1]]))),
+                  bquote(paste("BF:", .(BF[[1]]))))  
+    plotmat(m, pos = c(2,2), curve = 0.05,
+        box.type = "rect", box.prop = 0.5, 
+        shadow.size = 0,
+        arr.lwd = 1, arr.width = (m_arr * 0.04)+0.05,
+        arr.length = m_arr * 0.1, arr.type = "triangle",
+         main = mtext(do.call(expression, Lines),side=3, line=c(2,1,0,-1),
+                     cex = 0.7))
+    
+    }
+  }
+}
+dev.off()
+# display_names[i],"\n",
+
+
+
+pdf("fig/06_Transition_matrix_scaled_v02.pdf", height = 10, width=9)
+par(mfrow=c(3,3),
+    mar=c(0,0,5,0))
+for (i in 1:length(varN)){
+  for (j in 1:length(trees)){
+    for (k in 1:length(priors)){
+    model <- stats_all[varnames == varN[i] &
+                         tree == trees[j] &
+                         prior == priors[k] &
+                         model == "dependent" &
+                       .rownames %in% transitions]
+    BF <- round(data.table(Lh_all)[VARNAMES == varN[i] &
+                         t_name == trees[j] &
+                         prN == priors[k], "marginalLH_BF"], 1)[[1]]
+    
+    LH_ind <- round(data.table(Lh_all)[VARNAMES == varN[i] &
+                         t_name == trees[j] &
+                         prN == priors[k], "mean_marginalLH_independent"],1)[[1]]
+    
+    LH_dep <- round(data.table(Lh_all)[VARNAMES == varN[i] &
+                         t_name == trees[j] &
+                         prN == priors[k], "mean_marginalLH_dependent"],1)[[1]]
+                 
+    trs <- model[,"Mean"]
+    trs_num <- scales::rescale(as.numeric(trs$Mean), to=c(1,5))
+    trs <- round(scales::rescale(as.numeric(trs$Mean), to = c(0.01, 1)),2)
+    nms <- c("00","01","10","11")
+    m <- matrix(
+    c(0,trs[1],trs[2],0,
+    trs[3],0,0,trs[4],
+    trs[5],0,0,trs[6],
+    0,trs[7],trs[8],0),
+    nrow = 4, dimnames = list(nms,nms))
+    # make an arrow sclaing vector
+    m_arr <- matrix(
+    c(0,trs_num[1],trs_num[2],0,
+    trs_num[3],0,0,trs_num[4],
+    trs_num[5],0,0,trs_num[6],
+    0,trs_num[7],trs_num[8],0),
+    nrow = 4)
+    mn <- apply(m,1,as.numeric)
+    apply(mn,MARGIN=1, scales::rescale)
+    Lines <- list(bquote(.(tree_names[j])),
+                  bquote(paste("Lh" ["ind"], ":", .(LH_ind[[1]]))),
+                  bquote(paste("Lh" ["dep"], ":", .(LH_dep[[1]]))),
+                  bquote(paste("BF:", .(BF[[1]]))))         
+    
+    par(mar = c(2, 2, 2, 2))
+
+plotmat(m, pos = c(2,2), curve = 0.05,
+        box.type = "rect", box.prop = 0.5, 
+        shadow.size = 0,
+        arr.lwd = 1, arr.width = (m_arr * 0.04)+0.05,
+        arr.length = m_arr * 0.1, arr.type = "triangle",
+        main = mtext(do.call(expression, Lines),side=3, line=c(1,0,-1,-2),
+                     cex = 0.7))
+    }
+  }
+}
+dev.off()
+```
+
+#######################
+# Plotting the posterior distributions
+
+
+```{r}
+options(scipen=99999)
+BTV <- "BayesTraitsV3"
+BT_prefix <- "BT_19-07"
+OUTDIR = "BT/BT_19-07"
+stones_no = 1000
+stones_iter = 10000
+burnin = 10000000
+iterations = 510000000
+sampelfreq = 100
+chains = 4
+priors = c("PriorAll uniform 0 100", "PriorAll exp 10", "RJHP gamma 0 1 0 1")
+options(scipen=99999)
+varpairs <- list(c("Rec_binary", "bristle_binary"),
+                 c("Rec_binary", "an_binary"),
+                 c("bristle_binary", "an_binary"))
+```
+## Reading results in again.
+
+from the log files we want to extract thr posterior samples
+from the stones file we want just the marginal likelyhood (the likelyhood of the model given the data)
+
+```{r}
+parse_BT_output <- function(trees, priors, OUTDIR, varpairs) {
+  # given files in specific format this parses them and returns the result
+  var1 = varpairs[1]
+  var2 = varpairs[2]
+  tre_ls <- list()
+  print(paste0(c("Starting parsing of traits:", var1, var2)))
+for (i in 1:length(trees)){
+  t = trees[[i]]
+  t_name <- names(trees)[[i]]
+  print(paste("Working on tree:",t_name))
+  pr_ls <- list()
+  for (p in 1:length(priors)) {
+      prN <- unlist(strsplit(priors[p], split = " "))[2]
+      print(prN)
+      s_in = c(); c_in = mcmc.list(); c_dep = mcmc.list(); s_dep = c()
+      for (c in 1:chains){
+      n_in <- paste0(OUTDIR,"/",BT_prefix,"_",var1,"_",var2, "_", t_name,"_", "indep_",prN,"_ch", c)
+      logfile_in <- paste0(n_in, ".Log.txt")
+      stonefile_in <- paste0(n_in, ".Stones.txt")
+      n_dep <- paste0(OUTDIR,"/",BT_prefix,"_",var1,"_",var2, "_", t_name,"_", "dep_",prN,"_ch", c)
+      logfile_dep <- paste0(n_dep, ".Log.txt")
+      stonefile_dep <- paste0(n_dep, ".Stones.txt")
+      c_in[[c]] <- read_bt_discrete_mcmc(logfile_in)
+      c_dep[[c]] <- read_bt_discrete_mcmc(logfile_dep)
+      # stones results
+      s_in <- c(s_in,read_bt_discrete_marginalLH(stonefile_in))
+      s_dep <- c(s_dep,read_bt_discrete_marginalLH(stonefile_dep))
+      }
+      pr_res <- setNames(list(c_in,c_dep,s_in,s_dep),
+                         paste(rep(prN), c("chain_in", "chain_dep", "stone_in", "stone_dep")))
+      pr_ls[[p]] <- pr_res
+      names(pr_ls)[[p]] <- prN
+  }
+  tre_ls[[i]] <- pr_ls
+  names(tre_ls)[[i]] <- t_name
+  }
+  return(tre_ls)
+}
+
+read_bt_discrete_marginalLH <- function(path) {
+  require(coda)
+  require(dplyr)
+  BT_file <- path
+  FullOut <-  scan(file = BT_file, what="c", quiet=T, sep="\n")
+  BT_log <- read.table(BT_file, skip = (grep("Log marginal likelihood:", FullOut) - 1), sep = "\t", header = FALSE, quote="\"") %>% data.frame()
+  return(BT_log$V2)
+}
+
+read_bt_discrete_mcmc <- function(path) {
+  require(coda)
+  require(dplyr)
+  library(data.table)
+  BT_file <- path
+  FullOut <-  scan(file = BT_file, what="c", quiet=T, sep="\n")
+  BT_log <- fread(BT_file, skip = (grep("Iteration	Lh", FullOut) - 1), sep = "\t", header = TRUE, quote="\"") %>% data.frame()
+  BT_log <- BT_log[,1:ncol(BT_log)-1]
+  BT_log <- select(BT_log, -Tree.No, -Iteration)
+  BT_log_mcmc <- mcmc(BT_log)
+  return(BT_log_mcmc)
+}
+
+read_bt_discrete_mcmc2 <- function(path) {
+  require(coda)
+  require(dplyr)
+  library(data.table)
+  BT_file <- path
+  FullOut <-  scan(file = BT_file, what="c", quiet=T, sep="\n")
+  BT_log <- fread(BT_file, skip = (grep("Iteration	Lh", FullOut) - 1), sep = "\t", header = TRUE, quote="\"") %>% data.frame()
+  BT_log <- BT_log[,1:ncol(BT_log)-1]
+  BT_log <- tryCatch(
+    {select(BT_log, -Model.string, -`Dep...InDep`, -Tree.No, -Iteration)},
+                     error=function(cond){
+                       return(select(BT_log, -Model.string, -Tree.No, -Iteration))
+                     })
+  BT_log_mcmc <- mcmc(BT_log)
+  return(BT_log_mcmc)
+}
+
+parse_BT_output2 <- function(trees, priors, OUTDIR, varpairs) {
+  # given files in specific format this parses them and returns the result
+  var1 = varpairs[1]
+  var2 = varpairs[2]
+  tre_ls <- list()
+  print(paste0(c("Starting parsing of traits:", var1, var2)))
+for (i in 1:length(trees)){
+  t = trees[[i]]
+  t_name <- names(trees)[[i]]
+  print(paste("Working on tree:",t_name))
+  pr_ls <- list()
+  for (p in 1:length(priors)) {
+      prN <- priors[[p]]
+      print(prN)
+      s_in = c(); c_in = mcmc.list(); c_dep = mcmc.list(); s_dep = c()
+      for (c in 1:chains){
+      n_in <- paste0(OUTDIR,"/",BT_prefix,"_",var1,"_",var2, "_", t_name,"_", "indep_",prN,"_ch", c)
+      logfile_in <- paste0(n_in, ".Log.txt")
+      stonefile_in <- paste0(n_in, ".Stones.txt")
+      n_dep <- paste0(OUTDIR,"/",BT_prefix,"_",var1,"_",var2, "_", t_name,"_", "dep_",prN,"_ch", c)
+      logfile_dep <- paste0(n_dep, ".Log.txt")
+      stonefile_dep <- paste0(n_dep, ".Stones.txt")
+      c_in[[c]] <- read_bt_discrete_mcmc2(logfile_in)
+      c_dep[[c]] <- read_bt_discrete_mcmc2(logfile_dep)
+      # stones results
+      print(deparse(substitute(stonefile_in)))
+      s_in <- c(s_in,read_bt_discrete_marginalLH(stonefile_in))
+      s_dep <- c(s_dep,read_bt_discrete_marginalLH(stonefile_dep))
+      }
+      pr_res <- setNames(list(c_in,c_dep,s_in,s_dep),
+                         paste(rep(prN), c("chain_in", "chain_dep", "stone_in", "stone_dep")))
+      pr_ls[[p]] <- pr_res
+      names(pr_ls)[[p]] <- prN
+  }
+  tre_ls[[i]] <- pr_ls
+  names(tre_ls)[[i]] <- t_name
+  }
+  return(tre_ls)
+}
+```
+
+```{r}
+
+all_merged <- readRDS(file = paste0(OUTDIR,"/all_merged.Rdata"))
+str(all_merged[[1]])
+names(all_merged) <- sapply(varpairs, paste0, collapse="_v_")
+```
+
+
+This produces a nested list:
+
+* tree/data used
+  + prior used
+    - independent chains (4 mcmc lists)
+    - dependent chains (4 mcmc lists)
+    - marginal likelyhoods independent (vector)
+    - marginal likelihoods dependent (vector)
+
+We want to:
+plot posterior distribution depending on prior
+conduct likelihood ratio tests and store this as well.
+
+```{r}
+# foreach(x = 1:length(all_parsed)) %dopar% {
+#   lapply(pkg, require, character.only = TRUE)
+#   VARNAMES <- names(all_parsed)[x]
+#   tre_ls <- all_parsed[[x]]
+#   sink(paste0(OUTDIR,"/diagnostics/gelman_diagnostics",VARNAMES ,".txt"))
+# for (i in 1:ltre){
+#   t_name <- names(trees)[[i]]
+#   for (p in 1:length(priors)) {
+#     print(t_name)
+#     print(priors[[p]])
+#     print(paste(VARNAMES, "Gelman diagnostics for independent run"))
+#     print(gelman.diag(tre_ls[[i]][[p]][[1]]))
+#     print(paste(VARNAMES, "Gelman diagnostics for dependent run"))
+#     print(gelman.diag(tre_ls[[i]][[p]][[2]]))
+#     print("=====================================================================")
+#     }
+# }
+# sink()
+# 
+# 
+# pdf(paste0(OUTDIR,"/diagnostics/gelman_diagnostics",VARNAMES ,".pdf"), width = 21, height = 14)
+#   par(mfrow=c(4,6),oma = c(0, 0, 2, 0))
+#   for (i in 1:ltre){
+#     for (p in 1:length(priors)) {
+#       gelman.plot(tre_ls[[i]][[p]][[1]], auto.layout = FALSE, autoburnin=FALSE)
+#       plot.new()
+#       title(paste(VARNAMES, names(trees)[[i]], priors[[p]], "Gelman diagnostics for independent (1st) and dependent (2nd) run"), outer = TRUE, cex = 1.5)
+#       plot.new()
+#       gelman.plot(tre_ls[[i]][[p]][[2]], auto.layout = FALSE, autoburnin=FALSE)
+#       }
+#   }
+# dev.off()
+#   
+# }
+
+```
+
+
+## Same for rjhp
+
+```{r}
+priors = c("uniform 0 100", "exp 10", "rjhp")
+
+for (x in  1:length(all_merged)) {
+  #for (x in 1:length(all_merged)) {
+  lapply(pkg, require, character.only = TRUE)
+  VARNAMES <- names(all_merged)[x]
+  tre_ls <- all_merged[[x]]
+  sink(paste0(OUTDIR,"/diagnostics/gelman_diagnostics_",VARNAMES ,".txt"))
+for (i in 1:ltre){
+  t_name <- names(trees)[[i]]
+  for (p in 1:length(priors)) {
+    print(t_name)
+    print(priors[[p]])
+    print(paste(VARNAMES, "Gelman diagnostics for independent run"))
+    print(gelman.diag(tre_ls[[i]][[p]][[1]]))
+    print(paste(VARNAMES, "Gelman diagnostics for dependent run"))
+    print(gelman.diag(tre_ls[[i]][[p]][[2]]))
+    print("=====================================================================")
+    }
+}
+sink()
+
+
+pdf(paste0(OUTDIR,"/diagnostics/gelman_diagnostics_",VARNAMES ,".pdf"), width = 21, height = 14)
+  par(mfrow=c(4,6),oma = c(0, 0, 2, 0))
+  for (i in 1:ltre){
+    for (p in 1:length(priors)) {
+      gelman.plot(tre_ls[[i]][[p]][[1]], auto.layout = FALSE, autoburnin=FALSE)
+      plot.new()
+      title(paste(VARNAMES, names(trees)[[i]], priors[[p]], "Gelman diagnostics for independent (1st) and dependent (2nd) run"), outer = TRUE, cex = 1.5)
+      plot.new()
+      gelman.plot(tre_ls[[i]][[p]][[2]], auto.layout = FALSE, autoburnin=FALSE)
+      }
+  }
+dev.off()
+  
+}
+```
+
+
+After the diagnostic I plot the posterior distributions
+
+```{r}
+library(cowplot)
+ltre = 3
+priors = c("uniform 0 100", "exp 10", "rjhp")
+prtitle = c("Uniform prior", "Exponential prior", "Reversible-jump hyperprior")
+titles <- c("Received sperm location | Bristle state,", "Received sperm location | Antrum state,", "Bristle state | Antrum state,")
+treetitle <- c("H-IQ-TREE,", "H-ExaBayes,", "C-IQ-TREE,")
+
+for(x in 1: length(all_merged))  { # BT pairs
+  stats_mcmcs <- list()
+  quantile_mcmcs <- list()
+  VARNAMES <- names(all_merged)[x]
+  tre_ls <- all_merged[[x]]
+  
+  pdf(paste0("fig/06_BT_posterior_",VARNAMES ,"_fancy2.pdf"), width = 14, height = 14)
+  for (i in 1:ltre){
+    t = trees[[i]]
+    t_name <- names(trees)[[i]]
+    # keep priors together
+    plts <- list()
+    for (p in 1:length(priors)) {
+      prN <- unlist(strsplit(priors[p], split = " "))[2]
+      mcmcs <- tre_ls[[i]][[p]][[2]]
+      df_mcmcs <- as.data.frame(do.call(rbind,mcmcs))
+      
+      # make it small for testing:
+      #nrow(df_mcmcs)
+      #df_mcmcs <- df_mcmcs[1:10000,]
+      
+      df_tidy_all <- df_mcmcs %>%
+        rename(Log_likelihood = Lh,
+               '00 to 01' = q12,
+               '00 to 10' = q13,
+               '01 to 00' = q21,
+               '01 to 11' = q24,
+               '10 to 00' = q31,
+               '10 to 11' = q34,
+               '11 to 01' = q42,
+               '11 to 10' = q43
+               ) %>%
+        select(Log_likelihood, 
+               '00 to 10',
+               '01 to 11',
+               '00 to 01',
+               '10 to 11',
+               '10 to 00',
+               '11 to 01',
+               '01 to 00',
+               '11 to 10')
+      
+      df_tidy <- df_tidy_all %>%
+        select(-Log_likelihood) %>%
+        gather(key = var, value = val) %>%
+        mutate(var = factor(var, levels = c(
+          "00 to 10","00 to 01","10 to 00","01 to 00",
+          "01 to 11","10 to 11","11 to 01","11 to 10"
+        )))
+      
+      pLH <- ggplot(df_tidy_all) +
+        geom_histogram(aes(x=Log_likelihood, y=..ncount..), bins = 50) +
+        #geom_histogram(aes(x=val, y=(..count../sum(..count..))), bins= 50) +
+        #facet_wrap(~var,nrow= 2) +
+        #ggtitle(paste(title[x], treetitle[i], prtitle[p])) +
+        ylab("Frequency") +
+        xlab("Likelihood") +
+        theme_bw()
+      
+      p2 <- ggplot(df_tidy) +
+        geom_histogram(aes(x=val, y=..ncount..), bins = 50) +
+        #geom_histogram(aes(x=val, y=(..count../sum(..count..))), bins= 50) +
+        facet_wrap(~var,nrow= 2) +
+        #ggtitle(paste(title[x], treetitle[i], prtitle[p])) +
+        ylab("Frequency") +
+        xlab("Rate") +
+        theme_bw()
+
+      plot_row <- cowplot::plot_grid(p2, pLH)
+  # now add the title
+  title <- ggdraw() + 
+  draw_label(
+    paste(titles[x], treetitle[i], prtitle[p]),
+    fontface = 'bold',
+    x = 0,
+    hjust = 0
+  ) +
+  theme(
+    # add margin on the left of the drawing canvas,
+    # so title is aligned with left edge of first plot
+    plot.margin = margin(0, 0, 0, 7)
+  )
+  plts[[p]] <- plot_grid(
+  title, plot_row,
+  ncol = 1,
+  # rel_heights values control vertical title margins
+  rel_heights = c(0.1, 1)
+  )
+  
+    }
+    
+  print(plot_grid(plts[[1]], plts[[2]], plts[[3]], ncol=1))
+  }
+  
+  
+  
+  
+  
+  dev.off()
+}
+
+```
+
+
+```{r}
+priors = c("uniform 0 100", "exp 10", "rjhp")
+stats_all <- list()
+#stats_all <- foreach(x = 1: length(all_merged)) %dopar% {
+  for(x in 1:length(all_merged)){
+  stats_mcmcs <- list()
+  quantile_mcmcs <- list()
+  lapply(pkg, require, character.only = TRUE)
+  VARNAMES <- names(all_merged)[x]
+  tre_ls <- all_merged[[x]]
+
+  for (i in 1:ltre){
+    t = trees[[i]]
+    t_name <- names(trees)[[i]]
+    for (p in 1:length(priors)) {
+      prN <- unlist(strsplit(priors[p], split = " "))[1]
+      mcmcs <- tre_ls[[i]][[p]][[1]]
+      
+      s_mcmcs <- summary(mcmcs)
+      s_stats <- broom::tidy(s_mcmcs$statistics)
+      s_stats$tree <- t_name
+      s_stats$varnames <- VARNAMES
+      s_stats$prior <- prN
+      s_stats$model <- "independent"
+      stats_mcmcs <- rbind(stats_mcmcs, s_stats)
+
+      mcmcs <- tre_ls[[i]][[p]][[2]]
+      s_mcmcs <- summary(mcmcs)
+      s_stats <- broom::tidy(s_mcmcs$statistics)
+      s_stats$tree <- t_name
+      s_stats$varnames <- VARNAMES
+      s_stats$prior <- prN
+      s_stats$model <- "dependent"
+      stats_mcmcs <- rbind(stats_mcmcs, s_stats)
+      }
+  }
+  stats_all <- append(stats_all, list(stats_mcmcs))
+}
+
+quant_all <- list()
+#quant_all <- foreach(x = 1: length(all_parsed)) %dopar% {
+  for(x in 1:length(all_merged)){
+  stats_mcmcs <- list()
+  quantile_mcmcs <- list()
+  lapply(pkg, require, character.only = TRUE)
+  VARNAMES <- names(all_merged)[x]
+  tre_ls <- all_merged[[x]]
+
+  for (i in 1:ltre){
+    t = trees[[i]]
+    t_name <- names(trees)[[i]]
+    for (p in 1:length(priors)) {
+      prN <- unlist(strsplit(priors[p], split = " "))[1]
+      
+      mcmcs <- tre_ls[[i]][[p]][[1]]
+      s_mcmcs <- summary(mcmcs)
+      s_quant <- broom::tidy(s_mcmcs$quantiles)
+      s_quant$tree <- t_name
+      s_quant$varnames <- VARNAMES
+      s_quant$prior <- prN
+      s_quant$model <- "independent"
+      quantile_mcmcs <- rbind(quantile_mcmcs, s_quant)
+
+      mcmcs <- tre_ls[[i]][[p]][[2]]
+      s_mcmcs <- summary(mcmcs)
+      s_quant <- broom::tidy(s_mcmcs$quantiles)
+      s_quant$tree <- t_name
+      s_quant$varnames <- VARNAMES
+      s_quant$prior <- prN
+      s_quant$model <- "dependent"
+      quantile_mcmcs <- rbind(quantile_mcmcs, s_quant)
+      }
+  }
+  quant_all <- append(quant_all, list(quantile_mcmcs))
+}
+
+stats_all <- do.call(rbind, stats_all)
+quant_all <- do.call(rbind, quant_all)
+
+write.csv(stats_all, "output/06_BT_statistics_all_runs.csv", row.names = FALSE)
+write.csv(quant_all, "output/06_BT_quantiles_all_runs.csv", row.names = FALSE)
+```
+
+## Extract Lh and calculate BF
+
+```{r}
+priors = c("uniform 0 100", "exp 10", "rjhp")
+Lh_all <- list()
+#Lh_all <- foreach(x = 1: length(all_merged)) %dopar% {
+ for(x in 1:length(all_merged)){
+  Lh_df <- data.frame(VARNAMES = NA,
+                      t_name= NA, prN = NA,
+                     harmonic_mean_LH_independent=NA, harmonic_mean_LH_dependent=NA,
+        mean_marginalLH_independent=NA, mean_marginalLH_dependent=NA, marginalLH_BF=NA)
+  lapply(pkg, require, character.only = TRUE)
+  VARNAMES <- names(all_merged)[x]
+  tre_ls <- all_merged[[x]]
+
+  for (i in 1:ltre){
+    t = trees[[i]]
+    t_name <- names(trees)[[i]]
+    for (p in 1:length(priors)) {
+      prN <- unlist(strsplit(priors[p], split = " "))[1]
+      
+      harmonic_mean_LH_independent <- mean(unlist(tre_ls[[i]][[p]][[1]][,"Lh"]))
+      harmonic_mean_LH_dependent <-   mean(unlist(tre_ls[[i]][[p]][[2]][,"Lh"]))
+      mean_marginalLH_independent <- mean(tre_ls[[i]][[p]][[3]])
+      mean_marginalLH_dependent <- mean(tre_ls[[i]][[p]][[4]])
+      
+      marginalLH_BF = 2 * (mean_marginalLH_dependent - mean_marginalLH_independent)
+      
+      Lh_df <- rbind(Lh_df, c(VARNAMES, t_name, prN,
+                     harmonic_mean_LH_independent, harmonic_mean_LH_dependent,
+        mean_marginalLH_independent, mean_marginalLH_dependent, marginalLH_BF))
+      }
+  }
+  Lh_all <- append(Lh_all,list(Lh_df))
+}
+
+Lh_all <- na.omit(do.call(rbind,Lh_all))
+write.csv(Lh_all, "output/06_BT_BF_all_runs.csv", row.names = FALSE)
+```
+
